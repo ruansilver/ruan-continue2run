@@ -1,0 +1,20 @@
+{
+  "_comment": "Harness 注册表：Harness 标签 -> Adapter 模块。新增 Harness = 新增 adapters/<module>.py + 在这里加一条。别名匹配不区分大小写，_ 与空格视同 -。status 仅供人阅读，不参与逻辑。",
+  "adapters": {
+    "deepseek": {
+      "module": "deepseek",
+      "aliases": ["deepseek", "deepseek-harness", "dsh"],
+      "status": "implemented"
+    },
+    "codex": {
+      "module": "codex",
+      "aliases": ["codex"],
+      "status": "implemented"
+    },
+    "claude-code": {
+      "module": "claude_code",
+      "aliases": ["claude-code", "claudecode", "claude"],
+      "status": "stub"
+    }
+  }
+}
