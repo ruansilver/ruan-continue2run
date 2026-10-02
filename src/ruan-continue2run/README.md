@@ -185,7 +185,7 @@ Select-String -Path .ruan-continue2run\*.md -Pattern 'creation-call-result' -Con
 | Harness | Adapter | 状态 |
 |---|---|---|
 | DeepSeek Harness (DSH) | `scripts/adapters/deepseek.py` | **已实现**（创建方式经本机探测确认，见 8.3） |
-| Codex | `scripts/adapters/codex.py` | **已实现**（Codex CLI `exec`，见 8.4） |
+| Codex | `scripts/adapters/codex.py` | **已实现**（当前桌面版 Codex app-server，见 8.4） |
 | Claude Code | `scripts/adapters/claude_code.py` | 占位，未实现（返回 `NOT_IMPLEMENTED`） |
 
 占位 Adapter 不会假装创建：它们如实返回 `issued=false` + `NOT_IMPLEMENTED`，`finish` 会把它记进日志。
@@ -242,27 +242,28 @@ node <npm 全局>/node_modules/@deepseek-ai/dsh/lib/bin.js \
 
 ### 8.4 Codex Harness：探测到的事实与实现方式
 
-以下事实由本机 `codex-cli 0.155.1` 的 CLI 帮助、安装布局检查和 Adapter 启动参数探针确认：
+以下事实由本机 Codex Desktop 提供的 `CODEX_CLI_PATH`（`codex-cli 0.159.2`）、app-server 协议和 Adapter 启动参数探针确认：
 
 | 事实 | 证据 |
 |---|---|
-| 非交互创建入口是 `codex exec [OPTIONS] [PROMPT]`；PROMPT 使用 `-` 时从 stdin 读取 | `codex exec --help` |
-| 模型由 `--model <MODEL>` 指定 | `codex exec --help` |
-| 工作目录由 `--cd <DIR>` 指定 | `codex exec --help` |
-| Codex CLI 没有独立的 reasoning-effort 选项；配置键为 `model_reasoning_effort` | `codex exec --help`、本机 `~/.codex/config.toml` |
-| Windows 下优先使用原生 `codex.exe`；npm shim 无法直接作为 `Popen` 入口时解析到 `node .../codex.js` | 本机 `where.exe codex`、npm 包布局 |
+| app-server 的新会话入口是 `thread/start`，首轮提示入口是 `turn/start` | app-server JSON Schema、实测 |
+| `thread/start` 接受 `cwd`、`model`、`modelProvider` 及当前权限策略；`turn/start` 接受 `effort` 和首条 `input` | app-server JSON Schema、实测 |
+| Codex Desktop 通过 `CODEX_CLI_PATH` 提供与桌面相同版本的 CLI；它必须优先于 PATH 中可能更旧的 `codex` | 当前进程环境、`codex --version` |
+| app-server 的 `thread/read` 返回当前 thread 的 canonical `cwd`、`model`、`modelProvider`、`reasoningEffort` | `codex app-server generate-json-schema --experimental`、实测 `thread/read` |
 
 Adapter 的调用形态是：
 
 ```text
-codex exec [--model <model>] [--config model_reasoning_effort="<effort>"] \
-  --cd <working-directory> --skip-git-repo-check -
-stdin = relay_context.render_first_message(context)
+codex app-server --stdio
+  thread/start {cwd, model, modelProvider, threadSource="user"}
+  turn/start {threadId, effort, input=[render_first_message(context)]}
 ```
 
-它将 stdout/stderr 交给 `.ruan-continue2run/children/` 下的原始输出文件，启动后立即返回，
-不等待、不读取、不判断子会话是否运行。`working_directory` 缺失或无效时不发起调用；模型和思维深度缺失时不覆盖 Codex 配置，
-由调用方按 RelayContext 的 `null` 语义处理。
+调用前先用当前 thread id（`CODEX_THREAD_ID`，回退 `CODEX_SESSION_ID`）读取 app-server 的 canonical 运行配置，
+再把这些值传给 `thread/start` / `turn/start`。因此 RelayContext 中人工传入的模型、思维深度和工作目录不会覆盖当前会话的真实配置。
+worker 会保持 app-server 连接到首轮完成，使持久化 thread 能被 Codex Desktop 的正常会话列表识别；stdout/stderr 写入系统临时目录，
+避免项目目录只读时把会话创建误报为日志写入失败。当前 thread 的权限策略也会随配置传递，避免新线程退回到另一套沙箱。Adapter 只等待创建握手，
+不等待首轮之后的任务结果；CLI 找不到 thread id 或 canonical 配置不完整时不发起调用。
 
 ### 8.5 已知但**未采用**的其它入口
 

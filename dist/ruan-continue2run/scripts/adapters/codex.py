@@ -1,24 +1,18 @@
-"""Codex CLI Harness Adapter。
+"""Codex app-server Harness Adapter.
 
-Codex 的会话创建细节全部封装在本模块：
-
-    codex exec [--model <model>] [--config model_reasoning_effort=<effort>]
-        --cd <working-directory> --skip-git-repo-check -
-        stdin = relay_context.render_first_message(context)
-
-``-`` 让 ``codex exec`` 从 stdin 读取新会话的首条提示。Adapter 只负责把调用发出，
-不等待、不轮询、不判断子会话是否启动或运行成功。输出文件只用于保留子进程的原始事实，
-不属于 Relay 状态。
-
-实现依据：本机 ``codex-cli 0.155.1`` 的 ``codex exec --help`` 与实测 CLI 行为。模型和
-工作目录分别由 ``--model`` / ``--cd`` 表达；Codex CLI 没有独立的 reasoning-effort
-选项，因此用其配置键 ``model_reasoning_effort`` 传递 RelayContext 中已确认的思维深度。
+The desktop Codex process exposes the running thread's effective configuration
+through the local app-server protocol. We read that metadata, then use the
+same binary's ``thread/start`` and ``turn/start`` methods. This gives the new
+thread the same Desktop-visible source as a manually created thread while
+avoiding an older ``codex`` executable on PATH and display-label model ids.
 """
 import json
 import os
 import shutil
 import subprocess
 import sys
+import tempfile
+import time
 from pathlib import Path
 
 _SCRIPTS_DIR = Path(__file__).resolve().parent.parent
@@ -26,12 +20,13 @@ if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
 import relay_context  # noqa: E402
-import relay_log  # noqa: E402
 
 from .base import result  # noqa: E402
 
-# 允许联调/测试时显式指定启动器；正常运行优先使用 PATH 中的原生 codex 可执行文件。
 LAUNCHER_ENV = "RUAN_CONTINUE2RUN_CODEX_BIN"
+CODEX_PATH_ENV = "CODEX_CLI_PATH"
+THREAD_ENV_NAMES = ("CODEX_THREAD_ID", "CODEX_SESSION_ID")
+CONFIG_QUERY_TIMEOUT = 10.0
 
 _CREATE_NO_WINDOW = 0x08000000
 _CREATE_NEW_PROCESS_GROUP = 0x00000200
@@ -43,11 +38,7 @@ def detect():
 
 
 def _node_launcher_from_shim(shim):
-    """把 npm 的 .cmd/.ps1 shim 解析为 ``node .../codex.js``。
-
-    Windows 上直接把 .ps1 交给 ``subprocess.Popen`` 不可靠；解析到 JS 入口后，
-    argv 不再经过 shell 的二次解析。解析失败时返回 None，由调用方如实报告。
-    """
+    """把 Windows npm shim 解析为可直接交给 Popen 的 node argv。"""
     node = shutil.which("node")
     if not node:
         return None
@@ -63,117 +54,287 @@ def _node_launcher_from_shim(shim):
 
 
 def _resolve_launcher():
-    """返回可执行 argv 前缀；找不到 Codex CLI 时返回 None。"""
+    """返回 Codex 可执行文件 argv 前缀。
+
+    ``CODEX_CLI_PATH`` is injected by Codex Desktop and points at the binary
+    bundled with the running desktop version. It must win over PATH, where an
+    unrelated older npm CLI commonly appears first.
+    """
+    candidates = []
     override = os.environ.get(LAUNCHER_ENV)
     if override:
-        path = Path(override).expanduser()
-        if path.is_file():
-            if path.suffix.lower() in {".cmd", ".ps1", ".bat"}:
-                return _node_launcher_from_shim(path) or None
-            return [str(path)]
-        # 允许测试/联调环境把一个可由 PATH 解析的命令名放进覆盖变量。
-        resolved = shutil.which(override)
-        if resolved:
-            if Path(resolved).suffix.lower() in {".cmd", ".ps1", ".bat"}:
-                return _node_launcher_from_shim(resolved) or None
-            return [resolved]
-        return None
+        candidates.append(override)
+    bundled = os.environ.get(CODEX_PATH_ENV)
+    if bundled:
+        candidates.append(bundled)
+    candidates.extend(("codex", "codex.exe"))
 
-    # 原生安装优先：避免把 npm shim（.cmd/.ps1）当作可执行文件交给 Popen。
-    for name in ("codex.exe", "codex"):
-        resolved = shutil.which(name)
-        if resolved and Path(resolved).suffix.lower() not in {".cmd", ".ps1", ".bat"}:
-            return [resolved]
-
-    for name in ("codex", "codex.cmd", "codex.ps1"):
-        resolved = shutil.which(name)
-        if not resolved:
+    seen = set()
+    for candidate in candidates:
+        if candidate in seen:
             continue
-        launcher = _node_launcher_from_shim(resolved)
-        if launcher:
-            return launcher
+        seen.add(candidate)
+        path = Path(candidate).expanduser()
+        resolved = str(path) if path.is_file() else shutil.which(candidate)
+        if resolved and Path(resolved).is_file():
+            if Path(resolved).suffix.lower() in {".cmd", ".ps1", ".bat"}:
+                return _node_launcher_from_shim(resolved)
+            return [resolved]
     return None
 
 
-def _append_config(argv, key, value):
-    """追加一个安全的 TOML 字符串配置覆盖。"""
-    argv += ["--config", f"{key}={json.dumps(str(value), ensure_ascii=True)}"]
+def _write_json_line(stream, payload):
+    stream.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    stream.flush()
+
+
+def _read_json_line(stream, deadline):
+    """读取 app-server 的下一条 JSON 行，跳过异常诊断行。"""
+    while time.monotonic() < deadline:
+        line = stream.readline()
+        if not line:
+            return None
+        try:
+            return json.loads(line)
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
+def _thread_config(launcher, thread_id):
+    """从当前 Codex thread 读取 cwd/model/provider/reasoning effort。"""
+    argv = list(launcher) + ["app-server", "--stdio"]
+    proc = None
+    try:
+        proc = subprocess.Popen(
+            argv,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            cwd=os.getcwd(),
+            close_fds=os.name != "nt",
+        )
+        _write_json_line(
+            proc.stdin,
+            {
+                "id": 1,
+                "method": "initialize",
+                "params": {"clientInfo": {"name": "ruan-continue2run", "version": "1.0"}},
+            },
+        )
+        deadline = time.monotonic() + CONFIG_QUERY_TIMEOUT
+        initialized = False
+        while time.monotonic() < deadline:
+            msg = _read_json_line(proc.stdout, deadline)
+            if msg is None:
+                break
+            if msg.get("id") == 1:
+                if "error" in msg:
+                    return None, f"CODEX_CONFIG_QUERY_FAILED: initialize 失败：{msg['error']}"
+                initialized = True
+                break
+        if not initialized:
+            return None, "CODEX_CONFIG_QUERY_FAILED: app-server initialize 超时或已退出"
+
+        _write_json_line(
+            proc.stdin,
+            {
+                "id": 2,
+                "method": "thread/read",
+                "params": {"threadId": thread_id, "includeTurns": False},
+            },
+        )
+        while time.monotonic() < deadline:
+            msg = _read_json_line(proc.stdout, deadline)
+            if msg is None:
+                break
+            if msg.get("id") != 2:
+                continue
+            if "error" in msg:
+                return None, f"CODEX_CONFIG_QUERY_FAILED: thread/read 失败：{msg['error']}"
+            thread = (msg.get("result") or {}).get("thread") or {}
+            return thread, None
+        return None, "CODEX_CONFIG_QUERY_FAILED: thread/read 超时或已退出"
+    except OSError as exc:
+        return None, f"CODEX_CONFIG_QUERY_FAILED: 无法启动 app-server：{exc!r}"
+    finally:
+        if proc is not None:
+            try:
+                if proc.stdin:
+                    proc.stdin.close()
+            except OSError:
+                pass
+            try:
+                proc.terminate()
+                proc.wait(timeout=1)
+            except (OSError, subprocess.TimeoutExpired):
+                try:
+                    proc.kill()
+                    proc.wait(timeout=1)
+                except OSError:
+                    pass
+                except subprocess.TimeoutExpired:
+                    pass
+            for stream in (proc.stdout,):
+                try:
+                    if stream:
+                        stream.close()
+                except OSError:
+                    pass
+
+
+def _effective_params(context, thread):
+    """合并 app-server 的 canonical 参数和 RelayContext 的已知值。"""
+    supplied = context.get("runtime_params") or {}
+    cwd = thread.get("cwd") or supplied.get("working_directory")
+    model = thread.get("model") or supplied.get("model")
+    effort = thread.get("reasoningEffort") or supplied.get("thinking_depth")
+    provider = thread.get("modelProvider")
+    if not cwd:
+        return None, "CODEX_CWD_MISSING: 当前 Codex thread 没有可用 working directory"
+    if not model:
+        return None, "CODEX_MODEL_MISSING: 当前 Codex thread 没有可用 model"
+    if not effort:
+        return None, "CODEX_REASONING_EFFORT_MISSING: 当前 Codex thread 没有可用思维深度"
+    path = Path(str(cwd)).expanduser()
+    if not path.is_dir():
+        return None, f"CODEX_CWD_INVALID: working directory 不是有效目录：{cwd}"
+    settings = {}
+    rollout_path = thread.get("path")
+    if rollout_path:
+        try:
+            for line in Path(rollout_path).read_text(encoding="utf-8").splitlines():
+                payload = json.loads(line).get("payload") or {}
+                if payload.get("type") == "thread_settings_applied":
+                    settings = payload.get("thread_settings") or {}
+        except (OSError, json.JSONDecodeError):
+            settings = {}
+    active_profile = (settings.get("active_permission_profile") or {}).get("id")
+    sandbox = None
+    if active_profile == ":danger-full-access":
+        sandbox = "danger-full-access"
+    elif active_profile == ":workspace":
+        sandbox = "workspace-write"
+    elif active_profile == ":read-only":
+        sandbox = "read-only"
+    return {
+        "cwd": path,
+        "model": str(model),
+        "effort": str(effort),
+        "provider": provider,
+        "approval_policy": settings.get("approval_policy"),
+        "sandbox": sandbox,
+    }, None
+
+
+def _output_paths():
+    """给 app-server worker 的原始输出找不依赖项目权限的临时位置。"""
+    directory = Path(tempfile.mkdtemp(prefix="ruan-continue2run-codex-"))
+    return directory, directory / "context.json", directory / "status.json", directory / "stdout.log", directory / "stderr.log"
+
+
+def _read_status(path, deadline):
+    while time.monotonic() < deadline:
+        if path.is_file():
+            try:
+                return json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                pass
+        time.sleep(0.05)
+    return None
 
 
 def create(context):
-    """输入 RelayContext，返回 ``{"issued", "info", "error"}``。"""
+    """创建下一轮 Codex Desktop-visible 会话并返回统一结果。"""
     launcher = _resolve_launcher()
     if not launcher:
-        return result(
-            False,
-            error=(
-                "CODEX_LAUNCHER_NOT_FOUND: 在 PATH 中找不到原生 codex，"
-                "也无法从 npm shim 解析 codex.js，未执行任何创建"
-            ),
-        )
+        return result(False, error="CODEX_LAUNCHER_NOT_FOUND: 找不到 Codex CLI，未执行任何创建")
 
-    params = context.get("runtime_params") or {}
-    working_directory = params.get("working_directory")
-    if not working_directory:
-        return result(
-            False,
-            error="CODEX_CWD_MISSING: RelayContext 未提供 working_directory，未执行任何创建",
-        )
-    cwd = Path(working_directory).expanduser()
-    if not cwd.is_dir():
-        return result(
-            False,
-            error=f"CODEX_CWD_INVALID: working_directory 不是有效目录：{working_directory}，未执行任何创建",
-        )
+    thread_id = next((os.environ.get(name) for name in THREAD_ENV_NAMES if os.environ.get(name)), None)
+    if not thread_id:
+        return result(False, error="CODEX_THREAD_ID_MISSING: 无法读取当前 Codex thread id，未执行任何创建")
 
-    argv = list(launcher) + ["exec"]
-    if params.get("model") is not None:
-        argv += ["--model", str(params["model"])]
-    if params.get("thinking_depth") is not None:
-        _append_config(argv, "model_reasoning_effort", params["thinking_depth"])
-    argv += ["--cd", str(cwd), "--skip-git-repo-check", "-"]
+    thread, query_error = _thread_config(launcher, thread_id)
+    if query_error:
+        return result(False, error=query_error)
+    params, config_error = _effective_params(context, thread)
+    if config_error:
+        return result(False, error=config_error)
 
-    message = relay_context.render_first_message(context)
-    slug = relay_context.make_slug(context.get("task_entry") or "")
-    out_path, err_path = relay_log.child_output_paths(context, slug)
-
+    worker = Path(__file__).with_name("codex_worker.py")
+    directory, context_path, status_path, out_path, err_path = _output_paths()
+    context_path.write_text(json.dumps(context, ensure_ascii=False), encoding="utf-8")
+    argv = [
+        sys.executable,
+        str(worker),
+        "--launcher-json",
+        json.dumps(launcher),
+        "--context-path",
+        str(context_path),
+        "--status-path",
+        str(status_path),
+        "--stdout-path",
+        str(out_path),
+        "--stderr-path",
+        str(err_path),
+        "--cwd",
+        str(params["cwd"]),
+        "--model",
+        params["model"],
+        "--effort",
+        params["effort"],
+    ]
+    if params.get("provider"):
+        argv += ["--provider", str(params["provider"])]
+    if params.get("approval_policy"):
+        argv += ["--approval-policy", str(params["approval_policy"])]
+    if params.get("sandbox"):
+        argv += ["--sandbox", str(params["sandbox"])]
     try:
-        with open(out_path, "wb") as out_f, open(err_path, "wb") as err_f:
-            flags = {}
-            if os.name == "nt":
-                # 不使用 DETACHED_PROCESS：它会使子进程收不到 stdin 数据/EOF。
-                flags["creationflags"] = _CREATE_NO_WINDOW | _CREATE_NEW_PROCESS_GROUP
-            else:
-                flags["start_new_session"] = True
-            proc = subprocess.Popen(
-                argv,
-                cwd=str(cwd),
-                stdin=subprocess.PIPE,
-                stdout=out_f,
-                stderr=err_f,
-                close_fds=True,
-                **flags,
-            )
-            proc.stdin.write(message.encode("utf-8"))
-            proc.stdin.close()
-    except Exception as exc:  # noqa: BLE001 - Adapter 只如实报告，不重试
-        return result(
-            False,
-            error=(
-                f"CODEX_SPAWN_FAILED: {exc!r}，未创建下一会话 "
-                f"（子进程输出：{out_path} / {err_path}）"
-            ),
+        flags = {}
+        if os.name == "nt":
+            flags["creationflags"] = _CREATE_NO_WINDOW | _CREATE_NEW_PROCESS_GROUP
+        else:
+            flags["start_new_session"] = True
+        proc = subprocess.Popen(
+            argv,
+            cwd=str(params["cwd"]),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            **flags,
         )
+        pid = proc.pid
+        proc.returncode = proc.poll()
+        if proc.returncode is None:
+            proc.returncode = 0
+    except Exception as exc:  # noqa: BLE001 - Adapter 只如实报告，不重试
+        return result(False, error=f"CODEX_SPAWN_FAILED: {exc!r}，未创建下一会话")
+
+    status = _read_status(status_path, time.monotonic() + CONFIG_QUERY_TIMEOUT)
+    if not status:
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+        return result(False, error="CODEX_APP_SERVER_TIMEOUT: 创建调用未在时限内返回 thread/start/turn/start 结果")
+    if not status.get("issued"):
+        return result(False, error=f"CODEX_APP_SERVER_CREATE_FAILED: {status.get('error')}")
+    created_thread_id = status.get("thread_id")
 
     notes = [
         "创建调用已发出；这不表示新会话已启动或运行成功",
-        f"pid={proc.pid}",
-        f"cwd={cwd}",
-        f"command={' '.join(argv)}",
+        f"pid={pid}",
+        f"source_thread_id={thread_id}",
+        f"created_thread_id={created_thread_id}",
+        f"cwd={params['cwd']}",
+        f"model={params['model']}",
+        f"thinking_depth={params['effort']}",
+        f"worker_command={' '.join(argv)}",
         f"子进程原始输出：{out_path} / {err_path}",
     ]
-    if params.get("model") is None:
-        notes.append("RelayContext 未提供 model，未覆盖 Codex 配置")
-    if params.get("thinking_depth") is None:
-        notes.append("RelayContext 未提供 thinking_depth，未覆盖 Codex 配置")
+    if params.get("provider"):
+        notes.append(f"model_provider={params['provider']}")
     return result(True, info="; ".join(notes))
