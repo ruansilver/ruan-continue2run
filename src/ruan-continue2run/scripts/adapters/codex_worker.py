@@ -1,179 +1,182 @@
-"""Internal Codex app-server worker used by the Codex Adapter.
+"""Detached Codex app-server worker used by adapters.codex."""
+from __future__ import annotations
 
-This process owns the app-server connection until the first turn completes. It
-writes one handshake result to ``status_path`` for the parent Adapter and keeps
-all protocol output in the supplied files for post-run inspection.
-"""
 import argparse
 import json
 import os
+import selectors
+import signal
 import subprocess
-import sys
 import time
 from pathlib import Path
+from typing import Any
 
-SCRIPTS_DIR = Path(__file__).resolve().parent.parent
-if str(SCRIPTS_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPTS_DIR))
-
-import relay_context  # noqa: E402
-
-_CREATE_NO_WINDOW = 0x08000000
-_CREATE_NEW_PROCESS_GROUP = 0x00000200
+SCHEMA_VERSION = 1
 
 
-def _send(stream, payload):
-    stream.write(json.dumps(payload, ensure_ascii=False) + "\n")
-    stream.flush()
-
-
-def _status(path, payload):
+def atomic_status(path: Path, value: dict[str, Any]) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    tmp.write_text(json.dumps(value, ensure_ascii=False), encoding="utf-8")
+    os.chmod(tmp, 0o600)
     os.replace(tmp, path)
 
 
-def _read_response(stream, output, request_id, deadline):
-    while time.monotonic() < deadline:
-        line = stream.readline()
-        if not line:
-            return None
-        output.write(line)
-        output.flush()
-        try:
-            message = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if message.get("id") == request_id:
-            return message
-    return None
+def send(stream, value: dict[str, Any]) -> None:
+    stream.write(json.dumps(value, ensure_ascii=False) + "\n")
+    stream.flush()
 
 
-def _drain_until_done(stream, output, thread_id, deadline=None):
-    while deadline is None or time.monotonic() < deadline:
-        line = stream.readline()
-        if not line:
-            return
-        output.write(line)
-        output.flush()
-        try:
-            message = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if message.get("method") in {"turn/completed", "turn/failed", "turn/cancelled"}:
-            params = message.get("params") or {}
-            if params.get("threadId") in (None, thread_id):
-                return
-
-
-def run(args):
-    status_path = Path(args.status_path)
-    stdout_path = Path(args.stdout_path)
-    stderr_path = Path(args.stderr_path)
-    context = json.loads(Path(args.context_path).read_text(encoding="utf-8"))
-    launcher = json.loads(args.launcher_json)
-    cwd = str(Path(args.cwd).expanduser())
-    model = args.model
-    effort = args.effort
-    provider = args.provider or None
-    approval_policy = args.approval_policy or None
-    sandbox = args.sandbox or None
-    proc = None
+def read_messages(proc: subprocess.Popen, deadline: float, output_path: Path, on_message, stop_when=None):
+    if proc.stdout is None:
+        return
+    selector = selectors.DefaultSelector()
+    selector.register(proc.stdout, selectors.EVENT_READ)
     try:
-        with stdout_path.open("w", encoding="utf-8") as output, stderr_path.open("w", encoding="utf-8") as errors:
-            flags = {}
-            if os.name == "nt":
-                flags["creationflags"] = _CREATE_NO_WINDOW | _CREATE_NEW_PROCESS_GROUP
+        with output_path.open("a", encoding="utf-8") as output:
+            while time.monotonic() < deadline:
+                events = selector.select(max(0.01, deadline - time.monotonic()))
+                if not events:
+                    continue
+                line = proc.stdout.readline()
+                if not line:
+                    return
+                output.write(line)
+                output.flush()
+                try:
+                    message = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                on_message(message)
+                if stop_when is not None and stop_when():
+                    return
+    finally:
+        selector.close()
+
+
+def terminate(proc: subprocess.Popen | None) -> None:
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        if os.name != "nt":
+            os.killpg(proc.pid, signal.SIGTERM)
+        else:
+            proc.terminate()
+        proc.wait(timeout=1)
+    except (OSError, subprocess.TimeoutExpired):
+        try:
+            if os.name != "nt":
+                os.killpg(proc.pid, signal.SIGKILL)
             else:
-                flags["start_new_session"] = True
-            proc = subprocess.Popen(
-                list(launcher) + ["app-server", "--stdio"],
-                cwd=cwd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=errors,
-                text=True,
-                close_fds=True,
-                **flags,
-            )
-            deadline = time.monotonic() + 20
-            _send(proc.stdin, {
-                "id": 1,
-                "method": "initialize",
-                "params": {"clientInfo": {"name": "Codex Desktop", "version": "0.1"}},
-            })
-            message = _read_response(proc.stdout, output, 1, deadline)
-            if not message or "error" in message:
-                _status(status_path, {"issued": False, "error": f"initialize failed: {message!r}"})
-                return 2
+                proc.kill()
+        except OSError:
+            pass
 
-            start_params = {
-                "cwd": cwd,
-                "model": model,
-                "modelProvider": provider,
-                "threadSource": "user",
-            }
-            if approval_policy:
-                start_params["approvalPolicy"] = approval_policy
-            if sandbox:
-                start_params["sandbox"] = sandbox
-            _send(proc.stdin, {"id": 2, "method": "thread/start", "params": start_params})
-            message = _read_response(proc.stdout, output, 2, deadline)
-            if not message or "error" in message:
-                _status(status_path, {"issued": False, "error": f"thread/start failed: {message!r}"})
-                return 3
-            thread = (message.get("result") or {}).get("thread") or {}
-            thread_id = thread.get("id")
-            if not thread_id:
-                _status(status_path, {"issued": False, "error": "thread/start returned no thread id"})
-                return 4
 
-            _send(proc.stdin, {
-                "id": 3,
-                "method": "turn/start",
-                "params": {
-                    "threadId": thread_id,
-                    "input": [{"type": "text", "text": relay_context.render_first_message(context)}],
-                    "effort": effort,
-                },
-            })
-            message = _read_response(proc.stdout, output, 3, deadline)
-            if not message or "error" in message:
-                _status(status_path, {"issued": False, "error": f"turn/start failed: {message!r}"})
-                return 5
-            _status(status_path, {"issued": True, "thread_id": thread_id})
-            _drain_until_done(proc.stdout, output, thread_id)
+def run(request_path: Path, status_path: Path) -> int:
+    request = json.loads(request_path.read_text(encoding="utf-8"))
+    launcher = request["launcher"]
+    cwd = str(Path(request["cwd"]).expanduser())
+    logs = status_path.with_suffix(".events.log")
+    proc = None
+    thread_id = ""
+    evidence: dict[str, Any] = {}
+    effective: dict[str, Any] = {}
+    try:
+        flags: dict[str, Any] = {}
+        if os.name == "nt":
+            flags["creationflags"] = 0x08000000 | 0x00000200
+        else:
+            flags["start_new_session"] = True
+        proc = subprocess.Popen(
+            list(launcher) + ["app-server", "--stdio"],
+            cwd=cwd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            close_fds=os.name != "nt",
+            **flags,
+        )
+        deadline = time.monotonic() + float(request.get("startup_timeout", 20))
+        state = {"initialized": False, "thread_started": False, "turn_started": False, "running": False, "completed": False}
+
+        def handle(message: dict[str, Any]) -> None:
+            nonlocal thread_id, effective, evidence
+            if message.get("id") == 1 and "error" not in message:
+                state["initialized"] = True
+            if message.get("id") == 2:
+                if "error" in message:
+                    atomic_status(status_path, {"schema_version": 1, "phase": "failed", "error_code": "CODEX_THREAD_START_FAILED", "error_summary": str(message["error"])})
+                    return
+                thread = (message.get("result") or {}).get("thread") or {}
+                thread_id = str(thread.get("id") or "")
+                effective = {"working_directory": thread.get("cwd", cwd), "model": thread.get("model", request["model"]), "thinking_depth": thread.get("reasoningEffort", request["effort"]), "model_provider": thread.get("modelProvider", request["provider"])}
+                state["thread_started"] = bool(thread_id)
+            if message.get("id") == 3:
+                if "error" in message:
+                    phase = "unknown" if thread_id else "failed"
+                    atomic_status(status_path, {"schema_version": 1, "phase": phase, "thread_id": thread_id, "error_code": "CODEX_TURN_START_FAILED", "error_summary": str(message["error"])})
+                    return
+                state["turn_started"] = True
+            method = message.get("method") or ""
+            params = message.get("params") or {}
+            if method in {"turn/started", "item/started", "item/agentMessage/delta"} and params.get("threadId", thread_id) in {None, "", thread_id}:
+                state["running"] = True
+                evidence = {"method": method, "params": params}
+                atomic_status(status_path, {"schema_version": 1, "phase": "running", "thread_id": thread_id, "effective_parameters": effective, "startup_evidence": evidence})
+            if method == "turn/completed" and params.get("threadId", thread_id) in {None, "", thread_id}:
+                status = params.get("turn", {}).get("status") or params.get("status")
+                if status == "completed" and thread_id:
+                    state["running"] = True
+                    state["completed"] = True
+                    evidence = {"method": method, "params": params}
+                    atomic_status(status_path, {"schema_version": 1, "phase": "running", "thread_id": thread_id, "effective_parameters": effective, "startup_evidence": evidence})
+
+        send(proc.stdin, {"id": 1, "method": "initialize", "params": {"clientInfo": {"name": "ruan-continue2run", "title": "ruan-continue2run", "version": "2.0"}}})
+        read_messages(proc, deadline, logs, handle, lambda: state["initialized"])
+        if not state["initialized"]:
+            atomic_status(status_path, {"schema_version": 1, "phase": "failed", "error_code": "CODEX_INITIALIZE_FAILED", "error_summary": "initialize did not succeed"})
+            return 2
+        send(proc.stdin, {"method": "initialized", "params": {}})
+        params = {"cwd": cwd, "model": request["model"], "modelProvider": request["provider"], "threadSource": "user", "approvalPolicy": request["approval_policy"], "sandbox": request["sandbox"]}
+        send(proc.stdin, {"id": 2, "method": "thread/start", "params": params})
+        read_messages(proc, deadline, logs, handle, lambda: state["thread_started"] or status_path.is_file())
+        if not state["thread_started"]:
+            return 3
+        send(proc.stdin, {"id": 3, "method": "turn/start", "params": {"threadId": thread_id, "input": [{"type": "text", "text": request["payload"]}], "effort": request["effort"]}})
+        read_messages(proc, deadline, logs, handle, lambda: state["running"] or status_path.is_file())
+        if not state["turn_started"]:
+            atomic_status(status_path, {"schema_version": 1, "phase": "unknown" if thread_id else "failed", "thread_id": thread_id, "error_code": "CODEX_TURN_NOT_ACCEPTED", "error_summary": "turn/start was not accepted"})
+            return 4
+        if not state["running"]:
+            atomic_status(status_path, {"schema_version": 1, "phase": "unknown", "thread_id": thread_id, "effective_parameters": effective, "error_code": "CODEX_STARTUP_UNKNOWN", "error_summary": "turn accepted but no startup event observed"})
+            return 5
+        # Keep the app-server connection alive until the turn completes. The
+        # worker is detached from Adapter/Relay, so the old session may exit.
+        while proc.poll() is None and not state["completed"]:
+            read_messages(proc, time.monotonic() + 1.0, logs, handle, lambda: state["completed"])
+            time.sleep(0.05)
+        if proc.poll() is None and state["completed"]:
             try:
                 proc.stdin.close()
             except OSError:
                 pass
-            proc.wait(timeout=5)
-            return 0
-    except Exception as exc:  # worker reports to the parent; no retry
-        _status(status_path, {"issued": False, "error": repr(exc)})
-        if proc is not None:
-            try:
-                proc.terminate()
-            except OSError:
-                pass
+        return 0
+    except Exception as exc:
+        atomic_status(status_path, {"schema_version": 1, "phase": "unknown" if thread_id else "failed", "thread_id": thread_id, "error_code": "CODEX_WORKER_EXCEPTION", "error_summary": f"{type(exc).__name__}: {exc}"})
         return 6
+    finally:
+        terminate(proc)
 
 
-def main():
+def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--launcher-json", required=True)
-    parser.add_argument("--context-path", required=True)
-    parser.add_argument("--status-path", required=True)
-    parser.add_argument("--stdout-path", required=True)
-    parser.add_argument("--stderr-path", required=True)
-    parser.add_argument("--cwd", required=True)
-    parser.add_argument("--model", required=True)
-    parser.add_argument("--effort", required=True)
-    parser.add_argument("--provider")
-    parser.add_argument("--approval-policy")
-    parser.add_argument("--sandbox")
-    return run(parser.parse_args())
+    parser.add_argument("--request", required=True)
+    parser.add_argument("--status", required=True)
+    args = parser.parse_args()
+    return run(Path(args.request), Path(args.status))
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())

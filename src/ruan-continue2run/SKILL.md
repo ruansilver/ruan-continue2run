@@ -1,101 +1,93 @@
 ---
 name: ruan-continue2run
-description: >-
-  会话接力编排 Skill，仅限显式调用：只有当用户会话的第一条消息明确点名 ruan-continue2run 时才使用。
-  它让当前会话按放养模式（用户不在场）执行任务，并在会话结束前，通过对应 Harness 的 Adapter，
-  用同一任务入口与运行参数创建下一个会话，同时写入事实日志。
-  不要因为用户提到“继续”“接力”“下一个会话”“自动续跑”“新开会话”“接着做”等字眼就触发；
-  消息里没有显式出现 ruan-continue2run 时一律不要加载本 Skill——误触发会让会话在无人值守下
-  自行决策并不断创建新会话。
-metadata:
-  version: "1.0.0"
-  knowledge-doc: 源码目录的 README.md（只在源码目录里有，不随安装进技能目录）
+description: 仅显式触发的轻量会话接力 Skill。只有用户消息首行明确写出 `ruan-continue2run`（可带 `$`、`@` 或 `/` 前缀）时才使用；Relay Mode 在当前 session 即将结束时创建并确认下一个真实 session，Maintenance Mode 用于用户明确指定 Harness 后检查、创建或修复其 Adapter。不要因为“接着做”“继续”“接力”等词自行触发。
 ---
 
 # ruan-continue2run
 
-让当前会话在结束前，用同一任务入口和运行参数创建下一个会话，形成接力。
+本 Skill 只负责“当前 session → 下一 session”的可靠接力，不判断业务任务是否完成，也不因为 AI 觉得任务做完而停止。用户通过 cwd 级 `.ruan-continue2run/STOP`、Harness 自身中断，或不再显式启动 Relay 来停止。
 
-本 Skill **只做会话接力编排与记录**：在某个具体 Harness 上"如何创建会话"由 Adapter 负责，本文件不包含任何 Harness 创建细节，只负责按顺序调用 `scripts/relay.py` 的 `open` / `decision` / `finish` 三个子命令。
+设计权威来源是同包 `references/` 文档和 `archive/v2.0/design/design.md`。不要发明新的轮次、链状态、任务状态机、后台巡检、并发协调、版本仲裁、自动恢复或动态 Payload 机制。
 
-命令里的占位符：
+## 选择模式
 
-- `<skill_dir>`：本 `SKILL.md` 所在目录。
-- `<python>`：当前环境可用的 Python 3 解释器（Windows 本机通常是 `python`，Linux/macOS 通常是 `python3`；不确定时先跑一次 `<python> --version` 确认再往下做）。
-- `relay.py` 的 stdout 是 **ASCII 转义 JSON**：中文会以 `\uXXXX` 形式出现（stdout 编码不可信，这样才不会被终端/调用链改坏）。照转义还原即可，日志文件里是正常中文。
+读取用户消息首行：
 
-## 1. 开场：确认是否启用，并建立本会话日志
+- `ruan-continue2run`（可选 `$` / `@` / `/` 前缀）进入 Relay Mode；
+- `ruan-continue2run maintenance <harness>`，或用户明确要求检查、创建、修复某个 Harness Adapter，进入 Maintenance Mode；先读 `references/maintenance.md`；
+- 其他情况不使用本 Skill。
 
-取**本会话第一条用户消息的原文**（不是最新一条、也不是你自己复述的版本），原样写入一个临时文件（放到系统临时目录即可，例如 Windows 的 `$env:TEMP\ruan-first-message.txt`），然后运行：
+## Relay Mode
 
-```bash
-<python> <skill_dir>/scripts/relay.py open \
-  --message-file "<临时文件路径>" \
-  --model "<当前模型标识>" --thinking-depth "<当前思维深度>" --working-dir "<当前工作目录>"
+### Capture 与启动
+
+把用户首条消息完整写入 UTF-8 临时文件，再运行：
+
+```text
+python3 <skill_dir>/scripts/relay.py start --message-file <临时文件>
 ```
 
-- 运行参数只填**当前会话实际能确认的值**；确认不了就省略该参数，不要猜、不要用默认值凑。
-- 用临时文件是为了让第一条消息**逐字**进入载荷，避免 shell 引号、换行被改写。`relay.py open` 也接受从 stdin 读入，二选一即可。
+如 Harness 无法自动检测，可以使用 `--harness <name>`。只有用户明确提供而 Harness 无法读取的运行参数，才使用 `--set key=value`。
 
-读它输出的 JSON：
+脚本会：
 
-- `relay` 为 `false`：第一条消息并没有显式调用本 Skill（例如用户是会话中途才提到它）。**按普通会话处理**：不套用第 2 步的放养模式、不要写日志、不要创建下一会话，本 Skill 到此结束。
-- `relay` 为 `true`：记住 `log_path`、`slug`、`history_glob`，继续第 2 步。`warnings` 里的提示照常继续即可，不要自行补救。
-- 出现 `error`（例如 `LOG_WRITE_FAILED`）：本会话连接力日志都建不起来（常见原因：会话跑在只读沙箱里，工作目录不可写）。**按普通会话处理任务**，把错误如实告诉用户，不要重试、不要换目录、不要自己想办法创建会话。
+1. 只解析规定位置的 Skill/Harness/Control Metadata；
+2. 第一次 Capture 规范化为 UTF-8、LF、无 BOM，正文不 trim；
+3. 计算并保存 `task_entry_sha256`；
+4. 读取当前 Harness 观测值，构造 expected 参数；
+5. 把 expected 与 observed 分开落盘；
+6. 检查 cwd 级 STOP 和所有适用参数；
+7. 执行纯读取 Preflight。
 
-## 2. 正文：按放养模式执行任务
+Preflight 失败时不要执行长期任务，原样报告 `error_code` 和 `error_summary`，让用户另开 Maintenance。适用参数没有可靠 expected 值、Adapter 不能证明 supplied 值会被提交、参数发生漂移或 task entry hash 不一致时失败；observed 为 `unavailable` 只有在 supplied 例外成立时才可继续。
 
-读 `references/relay-override.md`，并按它执行 `context.task_entry` 里的任务。要点：用户不在场，遇到原本要停下来问的节点就自行判断并继续；**只认第一条消息**作为任务入口，之后用户再说什么都不改变它，也不进入交接内容。
+如果启动时发现 STOP，告诉用户“已检测到 STOP，本轮继续执行，但结束后不会继续接力”，然后执行当前任务并跳过 handoff。STOP 是当前 cwd 所有 Relay 共用的人工刹车；Maintenance 不得删除原本就存在的 STOP。
 
-## 3. 记录关键决策
+### 放养执行
 
-每次做出关键决策（尤其是本该问用户、改为自行判断的那些节点），立刻记一条：
+因任务方向选择原本要询问用户时，优先读取需求、设计、源码和持久资料，自行选择与既有设计一致且长期价值更高的方向继续。权限、sandbox、approval、真实工具故障仍按 Harness 边界处理，不升级权限。
 
-```bash
-<python> <skill_dir>/scripts/relay.py decision --log "<log_path>" \
-  --node "遇到的问题/节点" --choice "最终选择的方向" \
-  --basis "依据的文档或线索" --confidence "把握程度（high / medium / low）"
+重大决策可通过：
+
+```text
+python3 <skill_dir>/scripts/relay.py note --log <log_path> --text <一句话>
 ```
 
-只记事实，不写自我评价。命令细节见 `references/relay-override.md`。
+`note` 只记录短摘要，脚本会限制长度并脱敏。长期项目事实写入项目自己的正式文档。
 
-## 4. 收尾：创建下一会话（当前会话的最后一个动作）
+### Handoff
 
-任务告一段落时运行（不要先问自己"任务是不是已经完成、还要不要接力"——这不是本 Skill 的职责）：
+在当前 session 即将返回最终结果或触发生命周期结束之前执行：
 
-```bash
-<python> <skill_dir>/scripts/relay.py finish --log "<log_path>"
+```text
+python3 <skill_dir>/scripts/relay.py handoff --log <log_path>
 ```
 
-`finish` 会依次做三件事：写意图日志 → 通过 Adapter 创建下一会话 → 把创建调用的结果追加到本会话日志。它结束之后：
+必须使用 `start` 返回的精确 `log_path`，不能搜索“最新日志”。脚本会：
 
-- 不要再调用任何工具，不要重试，不要自己想办法创建会话，也不要修改 Adapter 或注册表。
-- 把输出 JSON 里的 `issued` / `info` / `error` 如实转述给用户，然后结束本会话。
-- `issued` 为 `false` 时（例如 `HARNESS_UNRESOLVED`、`HARNESS_UNREGISTERED`、`NOT_IMPLEMENTED`、`PENDING_CONFIRMATION`）同样如实转述：这说明接力没有发出，需要新增或修复某个 Harness 的支持，由用户另行进入"Skill 修复阶段"（见源码目录 `README.md` 第 8.6 节）。
+1. 再次检查 STOP；
+2. 从当前日志重新读取 RelayContext；
+3. 在任何 Adapter 副作用前原子创建一次 handoff claim；
+4. 已有最终结果则直接返回；只有 claim 没有结果则返回 `unknown`，不得再次创建；
+5. 在独立 Adapter 调用进程上施加 hard deadline；超时记为 `unknown`；
+6. 处理 `confirmed`、`failed`、`unknown` 和唯一一次安全重试；
+7. 将最终 AdapterResult 原子写回当前日志 sidecar。
 
-Adapter 的输入输出契约见 `references/adapter-contract.md`；日志格式与事实原则见 `references/log-format.md`。
+结果处理：
 
-## 不做的事
+- `confirmed`：只表示在 startup observation window 内已确认新 session 开始正常执行，不代表之后永不崩溃；当前 session 不再修改任务，直接结束。
+- `stopped_by_stop`：正常结束，不创建下一 session。
+- `failed` / `unknown`：不要现场维修或自行再次调用 handoff；如实报告 `error_code`、参数、hash、session reference 和尝试结果，建议另开 Maintenance。`unknown` 时新 session 可能已经存在。
 
-保持轻量。下面这些都不属于本 Skill，即使看起来"更完整"也不要加：
+## 文件
 
-- 任务状态管理（进度、轮次、链状态）
-- 自动完成判断（不判断"任务是否做完、还要不要接力"）
-- 自检、自动恢复、重试、巡检
-- 判断新会话是否真正运行成功（日志只写"创建调用已发出/未发出"）
-- 复制或注入历史上下文（历史决策只通过 `history_glob` 去读日志作参考）
-
-## 边界情况
-
-| 情况 | 怎么做 |
-|---|---|
-| 第一条消息没有 Harness 标签 | `open` 会让已注册 Adapter 做无副作用的被动识别；只有唯一结果才会选中。无法唯一识别时，`finish` 返回 `HARNESS_UNRESOLVED`。如实记录、如实报告，**不要**自己补标签或改注册表。 |
-| 标签不在注册表 | 同上，`finish` 返回 `HARNESS_UNREGISTERED`。这是"该 Harness 还没适配"，不是本会话要解决的问题。 |
-| 用户在本会话中途发消息 | 一律视为噪声：不进交接内容，也不改变任务入口。 |
-| 想终止链条 | 不需要本 Skill 做任何事：新会话开场时，如果它的第一条消息没有显式调用本 Skill，它就会按普通会话处理，链条自然结束。 |
-| 本会话已经执行过一次 `finish` | 不要重复执行。`finish` 会因为日志里已有 `intent` 而拒绝第二次创建，如实报告即可。 |
-| 日志写不进去（如只读沙箱） | `open` / `finish` 会返回 `LOG_WRITE_FAILED`：本会话按普通会话处理，如实报告，不要重试、不要换目录。 |
-
-## 待确认默认值
-
-触发写法（消息里出现 `ruan-continue2run`）、Harness 标签语法（消息末尾 `//HarnessName`）、日志目录名（`<工作目录>/.ruan-continue2run/`）都是**待确认默认值**，集中放在 `scripts/config.py` 并标有 PENDING。需要改动时只改那一处。
+- `scripts/relay.py`：Capture、参数校验、日志、STOP、Preflight、handoff claim、deadline、三态结果和安全重试；
+- `scripts/detect.py`：Harness 检测与 Adapter 加载；
+- `scripts/adapter_runner.py`：在独立进程中执行 Adapter 创建调用；
+- `scripts/adapters/`：每个 Harness 一个 Adapter；`_template.py` 是骨架，未真实验收的 Adapter 不得宣称支持；
+- `scripts/sync.py`：仅 Maintenance 使用，dry-run/整体同步/路径安全检查/完整性校验；
+- `references/adapter-contract.md`：参数状态、AdapterResult、错误码和生命周期契约；
+- `references/startup-confirmation.md`：三态、确认窗口、claim、deadline 和重试；
+- `references/log-format.md`：RelayContext、task hash、原子日志与 STOP 作用域；
+- `references/maintenance.md`：真实复现、STOP 所有权、最终减法、真实复验和 authoritative copy 同步；
+- `references/codex.md`：Codex Desktop bundled app-server Adapter 的参数映射、启动确认和验收边界。

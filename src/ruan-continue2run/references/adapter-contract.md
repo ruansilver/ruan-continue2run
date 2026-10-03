@@ -1,91 +1,131 @@
-# Adapter 契约
+# Adapter Contract
 
-本文件是 Adapter 接口的权威定义。核心 Skill（`SKILL.md`、`scripts/relay*.py`、`scripts/dispatch.py`）**不包含任何 Harness 的创建细节**；所有 Harness 差异都封装在 `scripts/adapters/<module>.py` 里，且都必须满足本契约。
+Adapter 负责所有 Harness 差异；`relay.py` 只做 Harness 无关的编排。一个 Adapter 是
+`scripts/adapters/<harness>.py`，文件名就是小写 Harness 名。
 
-契约是**设计和规则**层面的约定（输入、输出、允许做什么）。"某个 Harness 具体怎么创建会话"属于实现细节，写在对应 Adapter 里，不属于本文件。
-
-## 接口
-
-每个 Adapter 模块必须提供一个函数：
+## 模块级声明
 
 ```python
-def create(context: dict) -> dict:
-    ...
+SCHEMA_VERSION = 1
+INVOCATION = "ruan-continue2run"
+HANDOFF_DEADLINE_SECONDS = 60
+PARAMETER_APPLICABILITY = {
+    "working_directory": "required",
+    "model": "applicable",
+    "thinking_depth": "applicable",
+    "permission_mode": "applicable",
+    "sandbox_mode": "applicable",
+    "approval_mode": "applicable",
+}
+EXTRA_FIELDS = []
 ```
 
-可选地提供无副作用的 `detect() -> bool`。没有 `//HarnessName` 标签时，调度层会调用每个已注册
-Adapter 的 `detect()`，只有**唯一一个**返回 `True` 时才选中它；没有或多于一个匹配时保持
-`HARNESS_UNRESOLVED`。探测只能读取当前 Harness 的环境/进程事实，不能启动会话、写状态或修改载荷。
+`working_directory` 永远是本 Skill 的核心必需参数。其他字段必须显式声明为
+`applicable` 或 `not_applicable`；`required` 只表示适用且缺失时必然失败。没有声明的
+基础字段按 `applicable` 处理，避免静默跳过参数继承。
 
-调用方是 `scripts/dispatch.py`（`run_adapter`）。核心流程不会直接 import 任何具体 Adapter，只通过注册表（`scripts/adapters/registry.json`）+ 本契约与它们交互。
+## 参数状态
 
-## 输入：RelayContext
+`read_runtime_context()` 的每个字段返回：
+
+```json
+{"state": "observed|inherited|unavailable|not_applicable", "value": "..."}
+```
+
+- `observed`：当前 Harness/session 真实读到的值；
+- `inherited`：Harness 具有可靠的原生继承语义，并给出可验证值；
+- `unavailable`：字段适用，但无法可靠取得；
+- `not_applicable`：字段对该 Harness 根本不适用。
+
+`supplied` 只出现在 RelayContext 的 expected 参数中，表示用户显式提供。适用字段
+必须有可靠 expected 值；`unavailable` 不能被当作 `not_applicable`。当前 observed 为 `unavailable` 时，只有 expected 为 `supplied` 且 Adapter 能证明会按该显式值提交，才可继续。
+
+## 函数
+
+### `detect() -> bool`
+
+无副作用、快速判断当前进程是否确实运行在该 Harness 中。没有或多个 Adapter 匹配时
+Relay 停止并报告，不猜。用户显式指定 Harness 时不调用 detect。
+
+### `read_runtime_context() -> dict`
+
+读取当前 Harness/session 的真实观测值，不使用模型自述。读取失败的适用字段返回
+`unavailable`，不抛出未处理异常。
+
+### `preflight(ctx) -> {"ok": bool, "problems": [str], "error_code": str}`
+
+纯读取、无创建副作用。除 Harness 自身检查外，必须检查：
+
+- `working_directory` 可用；
+- 所有 `applicable` 参数都有 expected 值；
+- 当前 observed 值没有偏离 expected；
+- `task_entry_sha256` 与上一轮携带的 hash 一致；
+- Harness 创建接口和所需运行参数可访问。
+
+### `create_and_confirm(ctx, payload) -> AdapterResult`
+
+负责创建会话并在有限 observation window 内确认启动。Adapter 必须在
+`HANDOFF_DEADLINE_SECONDS` 内返回。
 
 ```json
 {
-  "task_entry": "用户显式任务入口（已剥离触发标记与 Harness 标签，逐字保留）",
-  "skill": "ruan-continue2run",
-  "runtime_params": {
-    "model": "当前模型标识，取不到为 null",
-    "thinking_depth": "当前思维深度，取不到为 null",
-    "working_directory": "当前工作目录，取不到为 null"
-  },
-  "harness": {
-    "tag": "用户写的原始 Harness 标签，可为 null",
-    "id": "注册表里解析出的标识，可为 null"
-  }
+  "schema_version": 1,
+  "status": "confirmed|failed|unknown",
+  "retryable": false,
+  "session_reference": "stable-id-or-empty",
+  "submitted_parameters": {},
+  "effective_parameters": {},
+  "startup_evidence": {},
+  "error_code": "",
+  "error_summary": ""
 }
 ```
 
-- 这就是 Relay Payload 的运行时形式：任务入口、Skill 自身、运行参数（含 Harness 标识），**不多不少**。
-- 取不到的运行参数是 `null`，Adapter **不得自行猜测填充**；确认不了的值就不填。无法处理的 `null` 要在返回的 `error` 或 `info` 里如实说明。
-- 新会话的第一条消息用 `relay_context.render_first_message(context)` 统一渲染（触发标记 + 任务入口 + Harness 标签），避免各 Adapter 各自拼装造成差异。
-- Adapter 可以读取**自己进程的环境**（例如 Harness 注入的环境变量、profile 配置）来把运行参数落到具体调用上——那是 Harness 适配层的事，不改变上面的载荷结构，也不往载荷里加东西。
+`submitted_parameters` 必须反映实际提交或可靠继承的参数；不能用模型猜测填充。
+`effective_parameters` 读不到时留空。`confirmed` 必须同时具备稳定会话标识、参数提交
+一致性和真实启动证据。
 
-## 输出：创建调用结果
+`relay.py` 会验证 `schema_version`、状态、会话标识、启动证据和参数一致性；Adapter 若返回
+`payload_sha256`，Relay 也会验证该 hash。验证失败会把结果降级为 `unknown`。Adapter 抛异常、超时或进程被终止，也统一
+按 `unknown` 处理，因为无法证明 Harness 没有收到创建请求。
 
-```json
-{ "issued": true, "info": "字符串或 null", "error": "字符串或 null" }
+## 错误码
+
+错误码使用稳定的大写短名称，例如：
+
+```text
+HARNESS_UNAVAILABLE
+PRECHECK_FAILED
+PARAMETER_UNAVAILABLE
+PARAMETER_DRIFT
+TASK_ENTRY_HASH_MISMATCH
+ADAPTER_TIMEOUT
+MISSING_CONFIRMATION_EVIDENCE
+SESSION_NOT_CREATED
+APPROVAL_BLOCKED
+UNKNOWN
 ```
 
-| 字段 | 含义 |
-|---|---|
-| `issued` | 布尔。创建调用是否**已发出**。 |
-| `info` | 调用返回的信息（例如会话标识、命令、进程号）。没有则 `null`。 |
-| `error` | 出错信息。`issued=false` 时必须给出；`issued=true` 时为 `null`。 |
+`error_summary` 只用于人类排查，长度受限且必须脱敏；不要把凭据、环境变量或完整
+headers 放入结果。Runtime parameter 字段名不得是 secret/token/password 等凭据字段；
+明显像凭据的参数值直接拒绝写入 RelayContext。
 
-**`issued` 只描述"创建调用本身"**：它不表示新会话已经运行，更不表示运行成功。Adapter 不得探测、等待、轮询或判断新会话之后的表现。
+## 硬契约
 
-## Adapter 必须遵守
+1. Payload 使用 API、argv、stdin 或安全临时文件传递，禁止拼接未可靠 escaping 的 shell 字符串。
+2. 新会话必须脱离 Adapter 调用、创建它的临时进程和旧会话进程组。
+3. Adapter 必须有限等待；Relay 还会施加外层 hard deadline。
+4. 不为了无人值守提升 permission、sandbox 或 approval。
+5. approval / permission / sandbox 阻塞不能算 `confirmed`。
+6. 不把安装位置私有配置写入正式 Skill 包。
+7. 不泄露 Secret。
+8. `confirmed` 只表示在 startup observation window 内已确认开始正常执行，不保证之后永不崩溃。
 
-- 只做"创建下一会话"这一件事：不写会话日志（日志由核心流程写）、不读写任何任务状态、不复制历史上下文。
-- 不重试、不自我修复、不做自检；失败就如实返回 `issued=false` 和 `error`。
-- 对 Harness 行为无法确认时**不要假设**：返回 `base.pending_confirmation(...)` 并列出待确认项，不要执行猜测性的调用。
-- 尚未实现的扩展位置返回 `base.not_implemented(...)`。
-- 可以复用 `adapters/base.py` 的 `result / not_implemented / pending_confirmation` 构造返回值。
+## 结果幂等
 
-## 调度层如何保证契约
+`relay.py` 在调用 Adapter 前对当前日志原子创建 handoff claim。同一日志：
 
-`dispatch.run_adapter` 会把下列情况统一转成 `issued=false` 的如实结果，**不会崩溃、不会重试、不会自动修复**：
+- 已存在最终结果：直接返回结果；
+- 只有 claim、没有最终结果：返回 `unknown`，禁止再次调用 Adapter。
 
-| error 前缀 | 情况 |
-|---|---|
-| `HARNESS_UNRESOLVED` | 没有 Harness 标签且 Adapter 被动探测没有唯一结果 |
-| `HARNESS_UNREGISTERED` | 标签不在注册表 |
-| `ADAPTER_LOAD_FAILED` | Adapter 模块加载失败 |
-| `ADAPTER_EXCEPTION` | `create()` 抛出异常 |
-| `ADAPTER_CONTRACT_VIOLATION` | 返回值不符合上面的输出结构 |
-
-## 注册表
-
-`scripts/adapters/registry.json` 把 Harness 标识、别名映射到 Adapter 模块：
-
-- 别名匹配不区分大小写，`_` 与空格视同 `-`（先归一化再比较）。
-- `status` 字段仅供人阅读，不参与逻辑。
-- 新增 Harness = 新增 `adapters/<module>.py` + 在注册表加一条；核心脚本与日志格式不动。
-
-## 扩展方式（设计文档第 7 节）
-
-- 新增某个 Harness 支持：新增一个对应的 Adapter，`SKILL.md` 与日志格式不动。
-- 某个 Harness 更新后创建失效：只修该 Harness 对应的 Adapter。
-- 以上都通过用户显式进入"Skill 修复阶段"完成（见源目录 `README.md` 第 8.6 节），不触碰其他部分。
+这只是当前会话的一次性副作用保护，不是任务状态机、轮次管理或 Chain State。

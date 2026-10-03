@@ -1,0 +1,23 @@
+{
+  "skill_name": "ruan-continue2run",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "ruan-continue2run\n//fake\n把这个任务入口原样传给下一会话：中文、多行、引号 ' 和 \"、$、反引号、反斜杠，并在每一轮保持一致。",
+      "expected_output": "Relay Mode 应捕获稳定 task entry，计算 hash，并在下一 Payload 中保持正文原样；没有真实 Adapter 时不能宣称已创建会话。",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "ruan-continue2run maintenance fake：检查 Adapter 的参数继承、startup confirmation、独立生命周期和 STOP 测试，然后说明哪些项目尚未经过真实 Harness 验收。",
+      "expected_output": "Maintenance Mode 应读取维护流程，真实环境不可验证的能力必须标记未验证，不能用静态检查替代。",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "普通地问：请解释一下会话接力、STOP 文件和 Adapter 是怎么工作的，不要执行任何 Relay。",
+      "expected_output": "因为没有显式调用 ruan-continue2run，Skill 不应进入 Relay 或创建会话。",
+      "files": []
+    }
+  ]
+}
