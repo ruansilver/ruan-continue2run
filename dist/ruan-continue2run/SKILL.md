@@ -90,4 +90,5 @@ python3 <skill_dir>/scripts/relay.py handoff --log <log_path>
 - `references/startup-confirmation.md`：三态、确认窗口、claim、deadline 和重试；
 - `references/log-format.md`：RelayContext、task hash、原子日志与 STOP 作用域；
 - `references/maintenance.md`：真实复现、STOP 所有权、最终减法、真实复验和 authoritative copy 同步；
-- `references/codex.md`：Codex Desktop bundled app-server Adapter 的参数映射、启动确认和验收边界。
+- `references/codex.md`：Codex Desktop bundled app-server Adapter 的参数映射、启动确认和验收边界；
+- `references/dsh.md`：DeepSeek Harness one-shot headless Adapter 的参数映射、创建与确认、错误码和验收边界。

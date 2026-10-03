@@ -28,4 +28,8 @@ python3 -m unittest discover -s tests -v
 python3 /home/ruan/.agents/skills/skill-creator/scripts/quick_validate.py src/ruan-continue2run
 ```
 
-未完成真实 Harness 验收的 Adapter 不得静态宣称支持。当前 Codex Desktop Adapter 的真实验收记录见 `reports/codex-desktop-acceptance.md`。
+未完成真实 Harness 验收的 Adapter 不得静态宣称支持。真实验收记录：
+
+- Codex Desktop Adapter：`reports/codex-desktop-acceptance.md`；
+- DeepSeek Harness (dsh) Adapter：`reports/dsh-acceptance.md`，创建面与边界见
+  `src/ruan-continue2run/references/dsh.md`。
