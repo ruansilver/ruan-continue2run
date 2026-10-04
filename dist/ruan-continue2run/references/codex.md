@@ -23,13 +23,18 @@ Adapter 通过当前 `CODEX_THREAD_ID` / `CODEX_SESSION_ID` 对 app-server 执�
 | `model` | `thread.model` / `thread/start.model` |
 | `thinking_depth` | `thread.reasoningEffort` / `turn/start.effort` |
 | `model_provider` | `thread.modelProvider` / `thread/start.modelProvider` |
-| `sandbox_mode` | permission profile 映射 / `thread/start.sandbox` |
+| `sandbox_mode` | `thread/read` 顶层 `sandbox`、rollout `sandbox_policy` / `thread/start.sandbox` |
 | `approval_mode` | thread settings approval policy / `thread/start.approvalPolicy` |
-| `permission_mode` | Desktop permission profile，用于期望值与报告；实际沙箱能力由 `sandbox_mode` 提交 |
+| `permission_mode` | `thread/read` 顶层 `activePermissionProfile`、rollout `active_permission_profile` / `thread/start.permissions` |
 
 缺少可靠来源时返回 `unavailable`，不使用模型自述或配置默认值冒充 observed。
 
 ## 创建与确认
+
+Adapter 的 `initialize.params.clientInfo` 必须复用 Codex Desktop 的身份：
+`{"name":"codex_desktop","title":"Codex Desktop",...}`。`clientInfo.name` 会参与线程
+归属标识；使用 `ruan-continue2run` 等自定义名称会让 Desktop 把新线程显示为“在其他应用中
+打开”，从而阻止用户继续交互。
 
 Adapter worker 使用：
 
@@ -41,8 +46,15 @@ initialize
 → turn/started 或 item/started 或 item/agentMessage/delta
 ```
 
+`initialize` 声明 `capabilities.experimentalApi=true`，以便使用 named `permissions`。
+`thread/start` 提交 `permissions` 时不同时提交 legacy `sandbox`；没有可用 named profile
+时才提交 `sandbox`。rollout 中的 `permission_profile.type=disabled` 描述本地环境，不能
+覆盖同一记录中的 `active_permission_profile.id`。
+
 只有观察到真实启动事件后才返回 `confirmed`。worker 脱离 Adapter/Relay 进程组继续持有
-app-server 连接，并在 turn 完成后退出。创建失败、approval 阻塞、超时或无法观察启动事件
+app-server 连接，并在 `turn/completed` 后关闭该连接和其子进程组；对部分 Desktop 版本只发送
+`thread/status/changed` 的 `idle`，worker 在已观察到启动事件后将该状态作为等价终态。终端事件
+同时写入原子状态文件，防止 selector/pipe 缓冲导致 worker 残留。创建失败、approval 阻塞、超时或无法观察启动事件
 按 2.0 三态契约返回 `failed` 或 `unknown`。
 
 ## 当前验收边界

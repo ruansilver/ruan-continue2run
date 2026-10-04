@@ -12,6 +12,11 @@ from pathlib import Path
 from typing import Any
 
 SCHEMA_VERSION = 1
+CLIENT_INFO = {
+    "name": "codex_desktop",
+    "title": "Codex Desktop",
+    "version": "2.0",
+}
 
 
 def atomic_status(path: Path, value: dict[str, Any]) -> None:
@@ -72,6 +77,16 @@ def terminate(proc: subprocess.Popen | None) -> None:
             pass
 
 
+def completion_was_recorded(path: Path) -> bool:
+    """Return true once the durable terminal event has been recorded."""
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    evidence = value.get("startup_evidence") or {}
+    return bool(value.get("turn_completed") or evidence.get("method") == "turn/completed")
+
+
 def run(request_path: Path, status_path: Path) -> int:
     request = json.loads(request_path.read_text(encoding="utf-8"))
     launcher = request["launcher"]
@@ -111,7 +126,10 @@ def run(request_path: Path, status_path: Path) -> int:
                     return
                 thread = (message.get("result") or {}).get("thread") or {}
                 thread_id = str(thread.get("id") or "")
+                active_profile = thread.get("activePermissionProfile") or {}
                 effective = {"working_directory": thread.get("cwd", cwd), "model": thread.get("model", request["model"]), "thinking_depth": thread.get("reasoningEffort", request["effort"]), "model_provider": thread.get("modelProvider", request["provider"])}
+                if isinstance(active_profile, dict) and active_profile.get("id"):
+                    effective["permission_mode"] = active_profile["id"]
                 state["thread_started"] = bool(thread_id)
             if message.get("id") == 3:
                 if "error" in message:
@@ -131,15 +149,35 @@ def run(request_path: Path, status_path: Path) -> int:
                     state["running"] = True
                     state["completed"] = True
                     evidence = {"method": method, "params": params}
-                    atomic_status(status_path, {"schema_version": 1, "phase": "running", "thread_id": thread_id, "effective_parameters": effective, "startup_evidence": evidence})
+                    atomic_status(status_path, {"schema_version": 1, "phase": "running", "thread_id": thread_id, "effective_parameters": effective, "startup_evidence": evidence, "turn_completed": True})
+            # Some bundled Desktop app-server builds emit the terminal idle
+            # status without a matching ``turn/completed`` notification. Once
+            # a turn has produced startup evidence, that transition is the
+            # durable signal that the external owner can be released.
+            if method == "thread/status/changed" and state["running"] and params.get("threadId", thread_id) in {None, "", thread_id}:
+                status = params.get("status") or {}
+                if status.get("type") == "idle":
+                    state["completed"] = True
+                    evidence = {"method": method, "params": params}
+                    atomic_status(status_path, {"schema_version": 1, "phase": "running", "thread_id": thread_id, "effective_parameters": effective, "startup_evidence": evidence, "turn_completed": True})
 
-        send(proc.stdin, {"id": 1, "method": "initialize", "params": {"clientInfo": {"name": "ruan-continue2run", "title": "ruan-continue2run", "version": "2.0"}}})
+        send(proc.stdin, {"id": 1, "method": "initialize", "params": {
+            "clientInfo": CLIENT_INFO,
+            "capabilities": {"experimentalApi": True},
+        }})
         read_messages(proc, deadline, logs, handle, lambda: state["initialized"])
         if not state["initialized"]:
             atomic_status(status_path, {"schema_version": 1, "phase": "failed", "error_code": "CODEX_INITIALIZE_FAILED", "error_summary": "initialize did not succeed"})
             return 2
         send(proc.stdin, {"method": "initialized", "params": {}})
-        params = {"cwd": cwd, "model": request["model"], "modelProvider": request["provider"], "threadSource": "user", "approvalPolicy": request["approval_policy"], "sandbox": request["sandbox"]}
+        params = {"cwd": cwd, "model": request["model"], "modelProvider": request["provider"], "threadSource": "user", "approvalPolicy": request["approval_policy"]}
+        # `permissions` and legacy `sandbox` are mutually exclusive in the
+        # app-server protocol. Named profiles preserve the Desktop permission
+        # mode and make it observable in the new thread's metadata.
+        if request.get("permission_profile"):
+            params["permissions"] = request["permission_profile"]
+        else:
+            params["sandbox"] = request["sandbox"]
         send(proc.stdin, {"id": 2, "method": "thread/start", "params": params})
         read_messages(proc, deadline, logs, handle, lambda: state["thread_started"] or status_path.is_file())
         if not state["thread_started"]:
@@ -156,6 +194,8 @@ def run(request_path: Path, status_path: Path) -> int:
         # worker is detached from Adapter/Relay, so the old session may exit.
         while proc.poll() is None and not state["completed"]:
             read_messages(proc, time.monotonic() + 1.0, logs, handle, lambda: state["completed"])
+            if completion_was_recorded(status_path):
+                state["completed"] = True
             time.sleep(0.05)
         if proc.poll() is None and state["completed"]:
             try:

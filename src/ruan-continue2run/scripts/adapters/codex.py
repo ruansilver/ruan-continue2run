@@ -20,6 +20,15 @@ from typing import Any
 
 SCHEMA_VERSION = 1
 INVOCATION = "ruan-continue2run"
+# Codex Desktop uses this app-server client identity.  Reusing it is required
+# for threads created by the adapter to remain owned by the Desktop client;
+# an arbitrary client name makes Desktop show the "opened in another app"
+# interlock even when the thread was created from the user's Desktop session.
+CLIENT_INFO = {
+    "name": "codex_desktop",
+    "title": "Codex Desktop",
+    "version": "2.0",
+}
 HANDOFF_DEADLINE_SECONDS = 60
 STARTUP_TIMEOUT_SECONDS = 20
 EXTRA_FIELDS = ["model_provider"]
@@ -184,7 +193,8 @@ def _rpc_thread_read(launcher: list[str], thread_id: str, cwd: str) -> tuple[dic
         proc = _spawn_app_server(launcher, cwd)
         deadline = time.monotonic() + 10
         _send(proc.stdin, {"id": 1, "method": "initialize", "params": {
-            "clientInfo": {"name": "ruan-continue2run", "title": "ruan-continue2run", "version": "2.0"}
+            "clientInfo": CLIENT_INFO,
+            "capabilities": {"experimentalApi": True},
         }})
         initialized = _read_until(proc, 1, deadline)
         if not initialized or "error" in initialized:
@@ -196,7 +206,19 @@ def _rpc_thread_read(launcher: list[str], thread_id: str, cwd: str) -> tuple[dic
             return None, "CODEX_CONFIG_QUERY_FAILED: thread/read timeout"
         if "error" in response:
             return None, f"CODEX_CONFIG_QUERY_FAILED: thread/read failed: {response['error']}"
-        thread = (response.get("result") or {}).get("thread") or {}
+        result = response.get("result") or {}
+        thread = dict(result.get("thread") or {})
+        # Current app-server exposes effective approval/sandbox/profile on the
+        # thread/read result envelope. Preserve those values for the adapter;
+        # they are distinct from turn_context.permission_profile, which can
+        # describe the local execution environment as "disabled".
+        for result_key, thread_key in (
+            ("approvalPolicy", "_activeApprovalPolicy"),
+            ("sandbox", "_activeSandbox"),
+            ("activePermissionProfile", "_activePermissionProfile"),
+        ):
+            if result_key in result:
+                thread[thread_key] = result[result_key]
         return thread, None
     except (OSError, ValueError) as exc:
         return None, f"CODEX_CONFIG_QUERY_FAILED: {type(exc).__name__}: {exc}"
@@ -221,6 +243,21 @@ def _settings_from_rollout(thread: dict[str, Any]) -> dict[str, Any]:
             payload = record.get("payload") or {}
             if payload.get("type") == "thread_settings_applied":
                 settings.update(payload.get("thread_settings") or {})
+            elif record.get("type") == "turn_context":
+                # New threads created through app-server persist effective
+                # runtime settings in turn_context rather than emitting the
+                # Desktop-only thread_settings_applied record.
+                if payload.get("approval_policy") is not None:
+                    settings.setdefault("approval_policy", payload["approval_policy"])
+                sandbox_policy = payload.get("sandbox_policy")
+                if sandbox_policy is not None:
+                    settings.setdefault("sandbox_policy", sandbox_policy)
+                active_profile = payload.get("active_permission_profile")
+                if isinstance(active_profile, dict) and active_profile.get("id"):
+                    settings.setdefault("active_permission_profile", active_profile)
+                permission_profile = payload.get("permission_profile")
+                if isinstance(permission_profile, dict) and permission_profile.get("id"):
+                    settings.setdefault("active_permission_profile", permission_profile)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return {}
     return settings
@@ -252,11 +289,25 @@ def read_runtime_context() -> dict[str, dict[str, str]]:
         return unavailable
     settings = _settings_from_rollout(thread)
     profile = os.environ.get("CODEX_PERMISSION_PROFILE")
-    profile = profile or settings.get("active_permission_profile") or settings.get("permission_profile")
+    profile = profile or settings.get("active_permission_profile") or thread.get("_activePermissionProfile") or settings.get("permission_profile")
     if isinstance(profile, dict):
         profile = profile.get("id") or profile.get("name")
     sandbox = _profile_to_sandbox(str(profile) if profile else None)
+    if not sandbox:
+        sandbox_policy = thread.get("_activeSandbox") or settings.get("sandbox_policy")
+        if isinstance(sandbox_policy, dict):
+            sandbox_type = str(sandbox_policy.get("type") or "")
+            sandbox = {
+                "danger-full-access": "danger-full-access",
+                "dangerFullAccess": "danger-full-access",
+                "read-only": "read-only",
+                "readOnly": "read-only",
+                "workspace-write": "workspace-write",
+                "workspaceWrite": "workspace-write",
+            }.get(sandbox_type)
     approval = settings.get("approval_policy", settings.get("approvalPolicy"))
+    if approval is None:
+        approval = thread.get("_activeApprovalPolicy")
     cwd = thread.get("cwd")
     model = thread.get("model")
     effort = thread.get("reasoningEffort") or thread.get("reasoning_effort")
@@ -345,6 +396,7 @@ def create_and_confirm(ctx: dict[str, Any], payload: str) -> dict[str, Any]:
         "provider": _expected(ctx, "model_provider"),
         "approval_policy": _approval_value(_expected(ctx, "approval_mode")),
         "sandbox": _expected(ctx, "sandbox_mode"),
+        "permission_profile": _expected(ctx, "permission_mode"),
     }
     request_path.write_text(json.dumps(request, ensure_ascii=False), encoding="utf-8")
     os.chmod(request_path, 0o600)
