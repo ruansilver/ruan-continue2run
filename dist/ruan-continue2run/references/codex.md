@@ -42,6 +42,7 @@ Adapter worker 使用：
 initialize
 → initialized
 → thread/start
+→ thread/name/set（`接力：ruan-continue2run`）
 → turn/start
 → turn/started 或 item/started 或 item/agentMessage/delta
 ```
@@ -52,10 +53,15 @@ initialize
 覆盖同一记录中的 `active_permission_profile.id`。
 
 只有观察到真实启动事件后才返回 `confirmed`。worker 脱离 Adapter/Relay 进程组继续持有
-app-server 连接，并在 `turn/completed` 后关闭该连接和其子进程组；对部分 Desktop 版本只发送
+app-server 连接，并在任意终态 `turn/completed`（completed/failed/interrupted/cancelled）后关闭该连接和其子进程组；对部分 Desktop 版本只发送
 `thread/status/changed` 的 `idle`，worker 在已观察到启动事件后将该状态作为等价终态。终端事件
 同时写入原子状态文件，防止 selector/pipe 缓冲导致 worker 残留。创建失败、approval 阻塞、超时或无法观察启动事件
 按 2.0 三态契约返回 `failed` 或 `unknown`。
+
+Codex confirmed 结果中的 `session_reference` 可拼成 `codex://threads/<session_reference>`。
+向用户报告 handoff 时同时给出这个链接，便于 Desktop 直接打开新线程；标题同步设置为
+`接力：ruan-continue2run`。由于 Adapter 使用独立 app-server，不能假设 Desktop 当前侧栏
+会立即刷新或自动切换到该线程。
 
 ## 当前验收边界
 

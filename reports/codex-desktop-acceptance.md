@@ -54,3 +54,24 @@ thread `01a1066b-e245-7842-9624-d7d27c9e01f4` 返回 `confirmed`，其 startup e
 `turn/started`。临时验收 thread 随后已归档。
 
 这证明了当前 bundled app-server 的创建、Payload 传递、真实启动、Skill 再触发和独立测试 cwd 路径。没有把静态检查或旧 CLI 版本当作真实支持证明。
+
+## 2026-10-05 回归与补丁
+
+用户回归截图证明前一版验收结论不完整。现场日志显示 thread
+`01a10aa6-8a68-7613-b873-f82097d07b31` 收到 `thread/status/changed: systemError`、
+`Selected model is at capacity`，随后 `turn/completed: status=failed`。旧 worker 只对
+`status=completed` 退出；对失败 turn 会继续持有独立 app-server 连接，导致 Desktop 持续显示
+“在另一个应用中打开”。
+
+本次补丁将 `completed`、`failed`、`interrupted`、`cancelled` 全部视为终态并释放连接，
+记录错误状态；新增回归测试覆盖模型容量失败场景。另在 `thread/start` 后调用
+`thread/name/set`，把侧栏标题设为 `接力：ruan-continue2run`，避免完整 relay 控制帧挤占标题、
+导致新会话难以辨认。27 项本地测试、Skill validator、dist 压缩包校验均通过；五个安装位置
+已同步同一份 authoritative copy。
+
+补充验证发现：外部 app-server 创建的 thread 会写入 `session_index.jsonl`，但当前已运行的
+Desktop sidebar/catalog 不会立即收到该进程的新增通知；因此不能仅靠 `thread/start` 保证
+新线程马上出现在侧栏。现在结果会把 `session_reference` 作为
+`codex://threads/<id>` 深链接交给上层，并将线程标题改为 `接力：ruan-continue2run`，
+用户可直接打开并辨认新线程。要让新线程自动进入 Desktop 当前 catalog，仍需要复用 Desktop
+自己的 app-server 连接或由 Desktop 提供显式创建接口，这属于当前 Adapter 外部能力边界。

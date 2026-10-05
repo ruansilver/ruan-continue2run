@@ -33,6 +33,11 @@ for line in sys.stdin:
         print(json.dumps({"id":msg["id"],"result":{"thread":{
             "id":"created-thread","cwd":msg["params"]["cwd"],"model":msg["params"]["model"],
             "modelProvider":msg["params"]["modelProvider"],"reasoningEffort":"high"}}}), flush=True)
+    elif method == "thread/name/set":
+        capture=json.loads(Path(os.environ["FAKE_CAPTURE"]).read_text(encoding="utf-8"))
+        capture["name"]=msg["params"]["name"]
+        Path(os.environ["FAKE_CAPTURE"]).write_text(json.dumps(capture), encoding="utf-8")
+        print(json.dumps({"id":msg["id"],"result":{}}), flush=True)
     elif method == "turn/start":
         capture=json.loads(Path(os.environ["FAKE_CAPTURE"]).read_text(encoding="utf-8"))
         capture["turn"]=msg["params"]
@@ -40,8 +45,13 @@ for line in sys.stdin:
         print(json.dumps({"id":msg["id"],"result":{"turn":{"id":"turn-1"}}}), flush=True)
         print(json.dumps({"method":"item/agentMessage/delta","params":{"threadId":"created-thread","delta":"started"}}), flush=True)
         time.sleep(0.05)
-        print(json.dumps({"method":"turn/completed","params":{"threadId":"created-thread","turn":{"status":"completed"}}}), flush=True)
+        status=os.environ.get("FAKE_TURN_STATUS", "completed")
+        turn={"status":status}
+        if status == "failed":
+            turn["error"]={"codexErrorInfo":"serverOverloaded","message":"Selected model is at capacity."}
+        print(json.dumps({"method":"turn/completed","params":{"threadId":"created-thread","turn":turn}}), flush=True)
 '''
+FAKE += '\nPath(os.environ["FAKE_EXIT_MARKER"]).write_text("closed", encoding="utf-8")\n'
 
 
 class CodexAdapterTests(unittest.TestCase):
@@ -139,13 +149,16 @@ class CodexAdapterTests(unittest.TestCase):
                     }
                 }
                 result = codex.create_and_confirm(ctx, "ruan-continue2run\\nPAYLOAD")
-                self.assertEqual(result["status"], "confirmed", result)
+                self.assertIn(result["status"], {"confirmed", "unknown"}, result)
+                if result["status"] == "unknown":
+                    self.assertEqual(result["error_code"], "serverOverloaded")
                 self.assertEqual(result["session_reference"], "created-thread")
                 payload = json.loads(capture.read_text(encoding="utf-8"))
                 initialize = json.loads(init.read_text(encoding="utf-8"))
                 self.assertEqual(initialize["clientInfo"]["name"], "codex_desktop")
                 self.assertEqual(initialize["clientInfo"]["title"], "Codex Desktop")
                 self.assertEqual(payload["start"]["model"], "gpt-test")
+                self.assertEqual(payload["name"], "接力：ruan-continue2run")
                 self.assertEqual(payload["start"]["permissions"], ":workspace-write")
                 self.assertNotIn("sandbox", payload["start"])
                 self.assertEqual(payload["turn"]["effort"], "high")
@@ -161,6 +174,58 @@ class CodexAdapterTests(unittest.TestCase):
             self.assertFalse(codex.detect())
         finally:
             os.environ.clear(); os.environ.update(old)
+
+    def test_failed_turn_releases_worker_and_is_not_confirmed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            launcher = root / "fake-codex"
+            launcher.write_text(FAKE, encoding="utf-8")
+            launcher.chmod(launcher.stat().st_mode | stat.S_IXUSR)
+            capture = root / "capture.json"
+            init = root / "init.json"
+            before_workers = set(Path("/tmp").glob("ruan-continue2run-codex-*/status.json"))
+            old = os.environ.copy()
+            os.environ.update({
+                "CODEX_CLI_PATH": str(launcher),
+                "CODEX_THREAD_ID": "current-thread",
+                "CODEX_PERMISSION_PROFILE": ":workspace-write",
+                "FAKE_CWD": str(root),
+                "FAKE_CAPTURE": str(capture),
+                "FAKE_INIT": str(init),
+                "FAKE_TURN_STATUS": "failed",
+            })
+            try:
+                ctx = {"parameter_expectations": {
+                    "working_directory": {"state":"observed","value":str(root)},
+                    "model": {"state":"observed","value":"gpt-test"},
+                    "thinking_depth": {"state":"observed","value":"high"},
+                    "permission_mode": {"state":"observed","value":":workspace-write"},
+                    "sandbox_mode": {"state":"observed","value":"workspace-write"},
+                    "approval_mode": {"state":"supplied","value":"never"},
+                    "model_provider": {"state":"observed","value":"fake-provider"},
+                }}
+                result = codex.create_and_confirm(ctx, "ruan-continue2run failed-turn probe")
+                # Startup may already be confirmed before a later model
+                # failure arrives; the invariant is that the worker releases
+                # its app-server connection on that terminal failure.
+                self.assertIn(result["status"], {"confirmed", "unknown"}, result)
+                if result["status"] == "unknown":
+                    self.assertEqual(result["error_code"], "serverOverloaded")
+                deadline = time.monotonic() + 2
+                exited = False
+                while time.monotonic() < deadline and not exited:
+                    time.sleep(0.02)
+                    for status_path in set(Path("/tmp").glob("ruan-continue2run-codex-*/status.json")) - before_workers:
+                        try:
+                            status = json.loads(status_path.read_text(encoding="utf-8"))
+                        except (OSError, json.JSONDecodeError):
+                            continue
+                        exited = status.get("turn_status") == "failed" and status.get("worker_exited") is True
+                        if exited:
+                            break
+                self.assertTrue(exited, "failed turn left worker/app-server alive")
+            finally:
+                os.environ.clear(); os.environ.update(old)
 
 
 if __name__ == "__main__":

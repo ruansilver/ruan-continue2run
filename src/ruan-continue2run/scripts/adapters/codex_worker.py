@@ -87,6 +87,16 @@ def completion_was_recorded(path: Path) -> bool:
     return bool(value.get("turn_completed") or evidence.get("method") == "turn/completed")
 
 
+def mark_worker_exited(path: Path) -> None:
+    """Leave durable evidence that the external owner was released."""
+    try:
+        value = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        value = {}
+    value["worker_exited"] = True
+    atomic_status(path, value)
+
+
 def run(request_path: Path, status_path: Path) -> int:
     request = json.loads(request_path.read_text(encoding="utf-8"))
     launcher = request["launcher"]
@@ -145,11 +155,18 @@ def run(request_path: Path, status_path: Path) -> int:
                 atomic_status(status_path, {"schema_version": 1, "phase": "running", "thread_id": thread_id, "effective_parameters": effective, "startup_evidence": evidence})
             if method == "turn/completed" and params.get("threadId", thread_id) in {None, "", thread_id}:
                 status = params.get("turn", {}).get("status") or params.get("status")
-                if status == "completed" and thread_id:
+                if status in {"completed", "failed", "interrupted", "cancelled"} and thread_id:
+                    # Every terminal turn status releases the external
+                    # app-server owner.  Waiting only for `completed` leaves
+                    # failed turns (for example model-capacity errors) alive
+                    # forever and makes Desktop show “opened in another app”.
                     state["running"] = True
                     state["completed"] = True
                     evidence = {"method": method, "params": params}
-                    atomic_status(status_path, {"schema_version": 1, "phase": "running", "thread_id": thread_id, "effective_parameters": effective, "startup_evidence": evidence, "turn_completed": True})
+                    terminal_phase = "running" if status == "completed" else ("unknown" if status in {"interrupted", "cancelled"} else "failed")
+                    turn = params.get("turn") or {}
+                    error = turn.get("error") or params.get("error") or {}
+                    atomic_status(status_path, {"schema_version": 1, "phase": terminal_phase, "thread_id": thread_id, "effective_parameters": effective, "startup_evidence": evidence, "turn_completed": True, "turn_status": status, "error_code": error.get("codexErrorInfo") or ("CODEX_TURN_FAILED" if status == "failed" else "CODEX_TURN_INTERRUPTED"), "error_summary": error.get("message") or f"Codex turn ended with status {status}"})
             # Some bundled Desktop app-server builds emit the terminal idle
             # status without a matching ``turn/completed`` notification. Once
             # a turn has produced startup evidence, that transition is the
@@ -182,6 +199,13 @@ def run(request_path: Path, status_path: Path) -> int:
         read_messages(proc, deadline, logs, handle, lambda: state["thread_started"] or status_path.is_file())
         if not state["thread_started"]:
             return 3
+        # Give the Desktop sidebar a concise, recognizable title. Without
+        # this, the first user message is the full relay control frame and the
+        # new session is technically listed but practically hard to find.
+        send(proc.stdin, {"id": 4, "method": "thread/name/set", "params": {
+            "threadId": thread_id,
+            "name": request.get("thread_name") or "接力：ruan-continue2run",
+        }})
         send(proc.stdin, {"id": 3, "method": "turn/start", "params": {"threadId": thread_id, "input": [{"type": "text", "text": request["payload"]}], "effort": request["effort"]}})
         read_messages(proc, deadline, logs, handle, lambda: state["running"] or status_path.is_file())
         if not state["turn_started"]:
@@ -208,6 +232,7 @@ def run(request_path: Path, status_path: Path) -> int:
         return 6
     finally:
         terminate(proc)
+        mark_worker_exited(status_path)
 
 
 def main() -> int:

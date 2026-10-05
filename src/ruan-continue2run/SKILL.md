@@ -76,6 +76,8 @@ python3 <skill_dir>/scripts/relay.py handoff --log <log_path>
 结果处理：
 
 - `confirmed`：只表示在 startup observation window 内已确认新 session 开始正常执行，不代表之后永不崩溃；当前 session 不再修改任务，直接结束。
+- Codex 的 `confirmed` 结果要同时报告 `session_reference` 和可点击的
+  `codex://threads/<session_reference>` 链接；这让用户能直接打开新线程，即使 Desktop 侧栏尚未刷新。
 - `stopped_by_stop`：正常结束，不创建下一 session。
 - `failed` / `unknown`：不要现场维修或自行再次调用 handoff；如实报告 `error_code`、参数、hash、session reference 和尝试结果，建议另开 Maintenance。`unknown` 时新 session 可能已经存在。
 

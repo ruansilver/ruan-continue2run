@@ -29,6 +29,7 @@ CLIENT_INFO = {
     "title": "Codex Desktop",
     "version": "2.0",
 }
+THREAD_NAME = "接力：ruan-continue2run"
 HANDOFF_DEADLINE_SECONDS = 60
 STARTUP_TIMEOUT_SECONDS = 20
 EXTRA_FIELDS = ["model_provider"]
@@ -397,6 +398,7 @@ def create_and_confirm(ctx: dict[str, Any], payload: str) -> dict[str, Any]:
         "approval_policy": _approval_value(_expected(ctx, "approval_mode")),
         "sandbox": _expected(ctx, "sandbox_mode"),
         "permission_profile": _expected(ctx, "permission_mode"),
+        "thread_name": THREAD_NAME,
     }
     request_path.write_text(json.dumps(request, ensure_ascii=False), encoding="utf-8")
     os.chmod(request_path, 0o600)
