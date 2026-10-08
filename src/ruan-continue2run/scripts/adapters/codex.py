@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 import os
-import selectors
 import shutil
 import signal
 import subprocess
@@ -18,8 +17,11 @@ import time
 from pathlib import Path
 from typing import Any
 
+from adapters._codex_protocol import read_message
+
 SCHEMA_VERSION = 1
 INVOCATION = "ruan-continue2run"
+PARAMETER_CAPTURE_PHASE = "handoff"
 # Codex Desktop uses this app-server client identity.  Reusing it is required
 # for threads created by the adapter to remain owned by the Desktop client;
 # an arbitrary client name makes Desktop show the "opened in another app"
@@ -134,27 +136,13 @@ def _send(stream, payload: dict[str, Any]) -> None:
 
 
 def _read_until(proc: subprocess.Popen, request_id: int, deadline: float) -> dict[str, Any] | None:
-    if proc.stdout is None:
-        return None
-    selector = selectors.DefaultSelector()
-    selector.register(proc.stdout, selectors.EVENT_READ)
-    try:
-        while time.monotonic() < deadline:
-            events = selector.select(max(0.01, deadline - time.monotonic()))
-            if not events:
-                continue
-            line = proc.stdout.readline()
-            if not line:
-                return None
-            try:
-                message = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if message.get("id") == request_id:
-                return message
-        return None
-    finally:
-        selector.close()
+    while time.monotonic() < deadline:
+        message = read_message(proc, deadline)
+        if message is None:
+            return None
+        if message.get("id") == request_id:
+            return message
+    return None
 
 
 def _terminate(proc: subprocess.Popen | None) -> None:
@@ -206,7 +194,7 @@ def _rpc_thread_read(launcher: list[str], thread_id: str, cwd: str) -> tuple[dic
         if not response:
             return None, "CODEX_CONFIG_QUERY_FAILED: thread/read timeout"
         if "error" in response:
-            return None, f"CODEX_CONFIG_QUERY_FAILED: thread/read failed: {response['error']}"
+            return None, "CODEX_CONFIG_QUERY_FAILED: thread/read failed"
         result = response.get("result") or {}
         thread = dict(result.get("thread") or {})
         # Current app-server exposes effective approval/sandbox/profile on the
@@ -227,6 +215,31 @@ def _rpc_thread_read(launcher: list[str], thread_id: str, cwd: str) -> tuple[dic
         _terminate(proc)
 
 
+def _rpc_config_read(launcher: list[str], cwd: str) -> dict[str, Any] | None:
+    """Inspect the worker's effective configuration without persisting secrets."""
+    proc = None
+    try:
+        proc = _spawn_app_server(launcher, cwd)
+        deadline = time.monotonic() + 10
+        _send(proc.stdin, {"id": 1, "method": "initialize", "params": {
+            "clientInfo": CLIENT_INFO, "capabilities": {"experimentalApi": True},
+        }})
+        initialized = _read_until(proc, 1, deadline)
+        if not initialized or "error" in initialized:
+            return None
+        _send(proc.stdin, {"method": "initialized", "params": {}})
+        _send(proc.stdin, {"id": 2, "method": "config/read", "params": {"cwd": cwd, "includeLayers": False}})
+        response = _read_until(proc, 2, deadline)
+        if not response or "error" in response:
+            return None
+        config = (response.get("result") or {}).get("config")
+        return config if isinstance(config, dict) else None
+    except (OSError, ValueError):
+        return None
+    finally:
+        _terminate(proc)
+
+
 def _canonical(value: Any) -> str:
     if isinstance(value, (dict, list)):
         return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -242,23 +255,30 @@ def _settings_from_rollout(thread: dict[str, Any]) -> dict[str, Any]:
         for line in Path(str(path)).read_text(encoding="utf-8").splitlines():
             record = json.loads(line)
             payload = record.get("payload") or {}
-            if payload.get("type") == "thread_settings_applied":
+            if record.get("type") == "session_meta" and payload.get("model_provider"):
+                settings["_initial_model_provider"] = payload["model_provider"]
+            elif payload.get("type") == "thread_settings_applied":
                 settings.update(payload.get("thread_settings") or {})
             elif record.get("type") == "turn_context":
                 # New threads created through app-server persist effective
                 # runtime settings in turn_context rather than emitting the
                 # Desktop-only thread_settings_applied record.
                 if payload.get("approval_policy") is not None:
-                    settings.setdefault("approval_policy", payload["approval_policy"])
+                    settings["approval_policy"] = payload["approval_policy"]
                 sandbox_policy = payload.get("sandbox_policy")
                 if sandbox_policy is not None:
-                    settings.setdefault("sandbox_policy", sandbox_policy)
+                    settings["sandbox_policy"] = sandbox_policy
                 active_profile = payload.get("active_permission_profile")
                 if isinstance(active_profile, dict) and active_profile.get("id"):
-                    settings.setdefault("active_permission_profile", active_profile)
+                    settings["active_permission_profile"] = active_profile
                 permission_profile = payload.get("permission_profile")
                 if isinstance(permission_profile, dict) and permission_profile.get("id"):
-                    settings.setdefault("active_permission_profile", permission_profile)
+                    if not (isinstance(active_profile, dict) and active_profile.get("id")):
+                        settings["active_permission_profile"] = permission_profile
+                for source, target in (("model", "model"), ("model_provider", "model_provider"),
+                                       ("effort", "reasoning_effort")):
+                    if source in payload:
+                        settings[target] = payload[source]
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return {}
     return settings
@@ -289,8 +309,8 @@ def read_runtime_context() -> dict[str, dict[str, str]]:
     if error or not thread:
         return unavailable
     settings = _settings_from_rollout(thread)
-    profile = os.environ.get("CODEX_PERMISSION_PROFILE")
-    profile = profile or settings.get("active_permission_profile") or thread.get("_activePermissionProfile") or settings.get("permission_profile")
+    profile = (settings.get("active_permission_profile") or thread.get("_activePermissionProfile")
+               or settings.get("permission_profile") or os.environ.get("CODEX_PERMISSION_PROFILE"))
     if isinstance(profile, dict):
         profile = profile.get("id") or profile.get("name")
     sandbox = _profile_to_sandbox(str(profile) if profile else None)
@@ -310,13 +330,19 @@ def read_runtime_context() -> dict[str, dict[str, str]]:
     if approval is None:
         approval = thread.get("_activeApprovalPolicy")
     cwd = thread.get("cwd")
-    model = thread.get("model")
-    effort = thread.get("reasoningEffort") or thread.get("reasoning_effort")
-    provider = thread.get("modelProvider") or thread.get("model_provider")
+    model = settings.get("model") or thread.get("model")
+    # null is an observed lack of a reasoning override, not an unreadable
+    # parameter. Keep it explicit across Relay's string-valued parameters.
+    effort_key = next((key for key in ("reasoningEffort", "reasoning_effort") if key in thread), None)
+    effort_available = "reasoning_effort" in settings or effort_key is not None
+    effort = settings.get("reasoning_effort") if "reasoning_effort" in settings else thread.get(effort_key)
+    provider = (settings.get("model_provider") or thread.get("modelProvider")
+                or thread.get("model_provider") or settings.get("_initial_model_provider"))
     result = dict(unavailable)
     result["working_directory"] = _runtime_value("observed", cwd) if cwd else result["working_directory"]
     result["model"] = _runtime_value("observed", model) if model else result["model"]
-    result["thinking_depth"] = _runtime_value("observed", effort) if effort else result["thinking_depth"]
+    if effort_available:
+        result["thinking_depth"] = _runtime_value("observed", "null" if effort is None else effort)
     if profile:
         result["permission_mode"] = _runtime_value("observed", profile)
     if sandbox:
@@ -360,6 +386,19 @@ def preflight(ctx: dict[str, Any]) -> dict[str, Any]:
         return {"ok": False, "error_code": "CODEX_RUNTIME_PARAMETER_UNAVAILABLE", "problems": [f"missing Codex parameters: {missing}"]}
     if sandbox not in _SANDBOXES:
         return {"ok": False, "error_code": "CODEX_SANDBOX_INVALID", "problems": [f"unsupported sandbox_mode: {sandbox!r}"]}
+    if provider != "openai":
+        config = _rpc_config_read(launcher, cwd)
+        if config is None:
+            return {"ok": False, "error_code": "CODEX_PROVIDER_CONFIG_UNAVAILABLE",
+                    "problems": ["cannot read the detached app-server provider configuration"]}
+        info = (config.get("model_providers") or {}).get(provider)
+        # Built-in local providers need no user-defined model_providers entry.
+        if not isinstance(info, dict) and provider not in {"ollama", "lmstudio"}:
+            return {"ok": False, "error_code": "CODEX_PROVIDER_NOT_CONFIGURED",
+                    "problems": ["the session provider is not defined for the detached app-server"]}
+        if isinstance(info, dict) and info.get("env_key") and not os.environ.get(info["env_key"], "").strip():
+            return {"ok": False, "error_code": "CODEX_PROVIDER_AUTH_UNAVAILABLE",
+                    "problems": ["the provider's configured credential environment variable is unavailable to the worker"]}
     return {"ok": True, "error_code": ""}
 
 

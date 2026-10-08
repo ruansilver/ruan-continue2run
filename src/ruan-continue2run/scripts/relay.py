@@ -326,10 +326,15 @@ def resolve_context(adapter: Any, harness: str, captured: dict[str, Any], cli_se
         raise CaptureError("carried expected parameters must cover exactly the Adapter fields")
     if captured["expected_hash"] and (cli_set or captured["bare_control"]):
         raise CaptureError("carried expectations cannot be overridden")
-    try:
-        runtime_raw = adapter.read_runtime_context() or {}
-    except Exception:
-        runtime_raw = {}
+    capture_phase = getattr(adapter, "PARAMETER_CAPTURE_PHASE", "start")
+    if capture_phase not in {"start", "handoff"}:
+        raise ParameterError("invalid Adapter PARAMETER_CAPTURE_PHASE")
+    runtime_raw = {}
+    if capture_phase == "start":
+        try:
+            runtime_raw = adapter.read_runtime_context() or {}
+        except Exception:
+            pass
     observations = normalize_runtime(runtime_raw, fields)
     if observations["working_directory"]["state"] == UNAVAILABLE:
         observations["working_directory"] = {"state": "observed", "value": str(Path.cwd().resolve())}
@@ -359,6 +364,31 @@ def resolve_context(adapter: Any, harness: str, captured: dict[str, Any], cli_se
         "expected_task_entry_sha256": captured["expected_hash"],
         "harness": harness,
         "slug": make_slug(captured["task_entry"]),
+        "parameter_expectations": expectations,
+        "parameter_observations": observations,
+        "parameter_capture_phase": capture_phase,
+    }
+
+
+def capture_handoff_context(adapter: Any, ctx: dict[str, Any]) -> dict[str, Any]:
+    """Capture one final runtime snapshot; never reuse an earlier runtime value."""
+    fields = control_fields(adapter)
+    try:
+        runtime = adapter.read_runtime_context() or {}
+    except Exception:
+        runtime = {}
+    observations = normalize_runtime(runtime, fields)
+    expectations = {
+        field: ({"state": NOT_APPLICABLE, "value": ""}
+                if applicability(adapter, field) == NOT_APPLICABLE else dict(observations[field]))
+        for field in fields
+    }
+    assert_safe_parameters(observations)
+    assert_safe_parameters(expectations)
+    return {
+        **ctx,
+        "parameter_capture_phase": "handoff",
+        "parameter_captured_at": now().isoformat(),
         "parameter_expectations": expectations,
         "parameter_observations": observations,
     }
@@ -447,6 +477,10 @@ def claim_path(log: Path) -> Path:
     return Path(str(log) + ".handoff.claim")
 
 
+def handoff_context_path(log: Path) -> Path:
+    return Path(str(log) + ".handoff.context.json")
+
+
 def read_result(log: Path) -> dict[str, Any] | None:
     path = result_path(log)
     if not path.is_file():
@@ -500,7 +534,7 @@ def applicability(adapter: Any, field: str) -> str:
     return str(value)
 
 
-def validate_context(adapter: Any, ctx: dict[str, Any]) -> tuple[list[str], str]:
+def validate_context(adapter: Any, ctx: dict[str, Any], *, capture_only: bool = False) -> tuple[list[str], str]:
     problems: list[str] = []
     if ctx.get("expected_task_entry_sha256") and ctx["expected_task_entry_sha256"] != ctx["task_entry_sha256"]:
         problems.append("task_entry_sha256 does not match the carried expected hash")
@@ -513,6 +547,9 @@ def validate_context(adapter: Any, ctx: dict[str, Any]) -> tuple[list[str], str]
     if str(Path(expected_cwd["value"]).expanduser().resolve()) != current_cwd:
         problems.append(f"working_directory mismatch: expected {expected_cwd['value']!r}, current {current_cwd!r}")
         return problems, "WORKING_DIRECTORY_DRIFT"
+
+    if capture_only:
+        return problems, ""
 
     for field, expected in ctx["parameter_expectations"].items():
         mode = applicability(adapter, field)
@@ -701,6 +738,7 @@ def cmd_start(args: argparse.Namespace) -> None:
         "slug": ctx["slug"],
         "task_entry_sha256": ctx["task_entry_sha256"],
         "runtime": ctx["parameter_expectations"],
+        "parameter_capture_phase": ctx["parameter_capture_phase"],
     }
     if not git_excluded:
         out["warning"] = "could not update .git/info/exclude; runtime files may be visible to Git"
@@ -718,12 +756,14 @@ def cmd_start(args: argparse.Namespace) -> None:
         out["notice"] = STOP_NOTICE
         emit(out)
 
-    problems, code = validate_context(adapter, ctx)
+    late_capture = ctx["parameter_capture_phase"] == "handoff"
+    problems, code = validate_context(adapter, ctx, capture_only=late_capture)
     try:
-        pf = adapter.preflight(ctx) or {}
-        if not pf.get("ok"):
-            problems += [redact(item) for item in (pf.get("problems") or ["adapter preflight failed"])]
-            code = pf.get("error_code") or code or "PRECHECK_FAILED"
+        if not late_capture:
+            pf = adapter.preflight(ctx) or {}
+            if not pf.get("ok"):
+                problems += [redact(item) for item in (pf.get("problems") or ["adapter preflight failed"])]
+                code = pf.get("error_code") or code or "PRECHECK_FAILED"
     except Exception as exc:
         problems.append(redact(f"adapter preflight raised {type(exc).__name__}: {exc}"))
         code = "PRECHECK_FAILED"
@@ -736,7 +776,8 @@ def cmd_start(args: argparse.Namespace) -> None:
                          **context_report(ctx),
                          "error_summary": safe_problems,
                          "next": "do not run the task; report this and let the user open a Maintenance session"}}, 3)
-    log_event(log, "preflight", "ok")
+    log_event(log, "capture" if late_capture else "preflight",
+              "ok; runtime capture and preflight deferred to handoff" if late_capture else "ok")
     emit(out)
 
 
@@ -764,6 +805,8 @@ def report_for(ctx: dict[str, Any], final: dict[str, Any], attempts: list[dict[s
         "sandbox_mode": display_value("sandbox_mode", expectations.get("sandbox_mode", {}).get("value", UNAVAILABLE)),
         "approval_mode": display_value("approval_mode", expectations.get("approval_mode", {}).get("value", UNAVAILABLE)),
         "task_entry_sha256": ctx.get("task_entry_sha256"),
+        "parameter_capture_phase": ctx.get("parameter_capture_phase", "start"),
+        "parameter_captured_at": ctx.get("parameter_captured_at"),
         "payload_sha256": payload_sha,
         "submitted_parameters": final.get("submitted_parameters", {}),
         "effective_parameters": final.get("effective_parameters", {}),
@@ -830,6 +873,38 @@ def cmd_handoff(args: argparse.Namespace) -> None:
         final = error_result("ADAPTER_MISSING", "adapter missing at handoff time", "failed")
         write_result(log, final)
         emit({"ok": False, "outcome": "failed", "report": report_for(ctx, final, [final], "")}, 11)
+
+    if getattr(adapter, "PARAMETER_CAPTURE_PHASE", "start") == "handoff":
+        try:
+            # The log remains tied to its original cwd/STOP scope even when
+            # the user changes model, provider, effort or permission settings.
+            problems, code = validate_context(adapter, ctx, capture_only=True)
+            if not problems:
+                ctx = capture_handoff_context(adapter, ctx)
+                atomic_write_text(handoff_context_path(log), json.dumps(ctx, ensure_ascii=False, indent=2) + "\n")
+                problems, code = validate_context(adapter, ctx)
+            if not problems:
+                pf = adapter.preflight(ctx) or {}
+                if not pf.get("ok"):
+                    problems = [redact(item) for item in (pf.get("problems") or ["adapter preflight failed"])]
+                    code = pf.get("error_code") or "PRECHECK_FAILED"
+        except Exception as exc:
+            problems = [f"final runtime preflight failed ({type(exc).__name__})"]
+            code = "PRECHECK_FAILED"
+        if problems:
+            final = error_result(code, " | ".join(problems), "failed")
+            report = report_for(ctx, final, [], "")
+            write_result(log, {"schema_version": SCHEMA_VERSION, "adapter_result": final,
+                              "ok": False, "outcome": "failed", "status": "failed", "report": report})
+            log_event(log, "handoff-preflight", f"FAILED {code}: {final['error_summary']}")
+            emit({"ok": False, "outcome": "failed", "report": report}, 11)
+        log_event(log, "handoff-preflight", "ok; final runtime snapshot captured")
+        if (root / "STOP").exists():
+            stopped = {"schema_version": SCHEMA_VERSION, "ok": True, "outcome": "stopped_by_stop", "status": "stopped_by_stop",
+                       "error_code": "STOP_PRESENT", "notice": "STOP 存在，本轮不创建下一会话。正常结束即可。"}
+            write_result(log, stopped)
+            log_event(log, "handoff", "STOP appeared during preflight; no next session created")
+            emit(stopped, 10)
 
     try:
         payload = build_payload(adapter, ctx)

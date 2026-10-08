@@ -10,6 +10,7 @@
 └── relay/
     ├── <timestamp>-<slug>-<random>.log
     ├── <same-log>.handoff.claim
+    ├── <same-log>.handoff.context.json
     └── <same-log>.handoff.result.json
 ```
 
@@ -39,6 +40,12 @@
 
 Capture 完成后立即原子写入。handoff 前必须从已锁定的 `current_log_path` 重新读取，不能
 依赖模型记忆重构 RelayContext。
+
+Codex 使用 `parameter_capture_phase: "handoff"`：开始日志只表示 Capture 的任务、cwd 和
+传入信息，不锁定模型参数。取得 claim 后从当前 Harness 重新读取参数，把含
+`parameter_captured_at` 的最终 RelayContext 原子写入 `<log>.handoff.context.json`；原日志头
+保留。Payload、提交校验及结果报告使用最终快照。快照读取失败不会用开始值补齐。
+该 sidecar 是单次创建的审计记录，不是链状态；重复调用仍先检查 claim/result。
 
 ## task entry 保真
 

@@ -9,7 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPTS = ROOT / "archive/v2.0/design/demo/ruan-continue2run/scripts"
+SCRIPTS = ROOT / "src/ruan-continue2run/scripts"
 sys.path.insert(0, str(SCRIPTS))
 import relay  # noqa: E402
 

@@ -12,6 +12,9 @@
 修改公共 Adapter Contract、`relay.py` 核心行为或多个 Harness 的共享逻辑时，停止并交回
 Skill 设计修订。
 
+用户明确要求改变公共契约或继承语义时，按已授权的设计修订处理，先更新现行 references
+并同步实现与验证；不把原来的“仅 Adapter 维护”范围当成需要重复征求授权的理由。
+
 Maintenance 默认串行执行；同一 cwd 不同时运行正式 Relay。
 
 ## 先探测，不假设

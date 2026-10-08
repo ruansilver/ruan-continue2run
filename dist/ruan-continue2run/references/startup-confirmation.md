@@ -14,8 +14,9 @@
 ## effective 参数
 
 Harness 能读到新会话真实生效值时应记录到 `effective_parameters`。读不到某一项不自动
-判定失败，但不能伪造为已验证。当前会话的 observed 值与上一轮 expected 值不一致时，
-Preflight 必须先失败，不能让 Adapter 用新值覆盖 expected。
+判定失败，但不能伪造为已验证。使用 `start` 策略时，当前会话 observed 与上一轮 expected
+不一致仍须 Preflight 失败。Codex 使用 `handoff` 策略，当前用户调整过的参数在交接时形成
+新的 expected 快照；子会话的提交和 effective 校验针对这份快照，不能沿用本轮开始值。
 
 ## approval 阻塞
 

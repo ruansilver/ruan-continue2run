@@ -9,6 +9,7 @@ Adapter 负责所有 Harness 差异；`relay.py` 只做 Harness 无关的编排�
 SCHEMA_VERSION = 1
 INVOCATION = "ruan-continue2run"
 HANDOFF_DEADLINE_SECONDS = 60
+PARAMETER_CAPTURE_PHASE = "start"  # 缺省值；Codex 声明 "handoff"
 PARAMETER_APPLICABILITY = {
     "working_directory": "required",
     "model": "applicable",
@@ -37,8 +38,15 @@ EXTRA_FIELDS = []
 - `unavailable`：字段适用，但无法可靠取得；
 - `not_applicable`：字段对该 Harness 根本不适用。
 
+`PARAMETER_CAPTURE_PHASE` 可为 `start`（兼容默认）或 `handoff`。后者在 handoff 中读取并
+验证最终参数，在开始阶段只 Capture 任务、hash、cwd 与传入信息。详见
+`runtime-inheritance.md`；该策略同时适用于该 Adapter 的官方与第三方 provider。
+
 `supplied` 只出现在 RelayContext 的 expected 参数中，表示用户显式提供。适用字段
 必须有可靠 expected 值；`unavailable` 不能被当作 `not_applicable`。当前 observed 为 `unavailable` 时，只有 expected 为 `supplied` 且 Adapter 能证明会按该显式值提交，才可继续。
+
+上面的 supplied 例外仅适用于 `start` 策略。`handoff` 策略只使用交接时实际读取的参数；
+不可读时不能回退到开始的 supplied/observed 值，也不能凭它们覆盖当前用户选择。
 
 ## 函数
 
